@@ -9,6 +9,7 @@ use zeroclaw_api::model_provider::{ChatMessage, ChatResponse};
 use zeroclaw_api::tool::ToolResult;
 
 use super::traits::{HookHandler, HookResult};
+use super::types::TurnCompleteSummary;
 
 /// Dispatcher that manages registered hook handlers.
 ///
@@ -117,6 +118,15 @@ impl HookRunner {
             .handlers
             .iter()
             .map(|h| h.on_heartbeat_tick())
+            .collect();
+        join_all(futs).await;
+    }
+
+    pub async fn fire_on_turn_complete(&self, summary: &TurnCompleteSummary) {
+        let futs: Vec<_> = self
+            .handlers
+            .iter()
+            .map(|h| h.on_turn_complete(summary))
             .collect();
         join_all(futs).await;
     }
@@ -358,6 +368,9 @@ mod tests {
         async fn on_heartbeat_tick(&self) {
             self.fire_count.fetch_add(1, Ordering::SeqCst);
         }
+        async fn on_turn_complete(&self, _summary: &TurnCompleteSummary) {
+            self.fire_count.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     /// A modifying hook that uppercases the prompt.
@@ -431,6 +444,30 @@ mod tests {
 
         let names: Vec<&str> = runner.handlers.iter().map(|h| h.name()).collect();
         assert_eq!(names, vec!["high", "mid", "low"]);
+    }
+
+    #[tokio::test]
+    async fn on_turn_complete_fires_all_handlers() {
+        let mut runner = HookRunner::new();
+        let (h1, c1) = CountingHook::new("hook_a", 0);
+        let (h2, c2) = CountingHook::new("hook_b", 0);
+        runner.register(Box::new(h1));
+        runner.register(Box::new(h2));
+
+        let summary = TurnCompleteSummary {
+            session_id: None,
+            channel: Some("cli".into()),
+            agent_alias: "default".into(),
+            user_message: "hi".into(),
+            final_response: "hello".into(),
+            tool_calls: vec![],
+            turn_duration_ms: 42,
+            success: true,
+        };
+        runner.fire_on_turn_complete(&summary).await;
+
+        assert_eq!(c1.load(Ordering::SeqCst), 1);
+        assert_eq!(c2.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

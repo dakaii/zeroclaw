@@ -517,14 +517,11 @@ pub async fn run_gateway(
     let config_state = Arc::new(RwLock::new(config.clone()));
 
     // ── Hooks ──────────────────────────────────────────────────────
-    let hooks: Option<std::sync::Arc<zeroclaw_runtime::hooks::HookRunner>> = if config.hooks.enabled
-    {
-        Some(std::sync::Arc::new(
-            zeroclaw_runtime::hooks::HookRunner::new(),
-        ))
-    } else {
-        None
-    };
+    let hooks = zeroclaw_runtime::hooks::build_hook_runner(
+        &config.hooks,
+        &config.plugins,
+        &config.data_dir,
+    );
 
     let addr: SocketAddr = match format!("{host}:{port}").parse() {
         Ok(a) => a,

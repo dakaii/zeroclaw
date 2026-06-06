@@ -59,6 +59,28 @@ struct PluginToolResult {
     error: Option<String>,
 }
 
+/// Input envelope for the `on_hook` export.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HookInvokeRequest {
+    pub event: String,
+    pub payload: serde_json::Value,
+}
+
+/// Response envelope from the `on_hook` export.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HookInvokeResponse {
+    #[serde(default = "default_continue_action")]
+    pub action: String,
+    #[serde(default)]
+    pub payload: Option<serde_json::Value>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+fn default_continue_action() -> String {
+    "continue".into()
+}
+
 // ── Host function implementations ─────────────────────────────────
 
 fn handle_http_request(
@@ -198,6 +220,31 @@ pub fn call_tool_metadata(plugin: &mut extism::Plugin) -> Result<ToolMetadata> {
         .context("failed to call tool_metadata export")?;
 
     serde_json::from_str(&output).context("failed to parse tool_metadata JSON")
+}
+
+/// Call the `on_hook` export with a lifecycle event envelope.
+///
+/// Returns `Ok(None)` when the export is absent (void hooks treat this as no-op).
+pub fn call_on_hook(
+    plugin: &mut extism::Plugin,
+    event: &str,
+    payload: serde_json::Value,
+) -> Result<Option<HookInvokeResponse>> {
+    let request = HookInvokeRequest {
+        event: event.to_string(),
+        payload,
+    };
+    let input = serde_json::to_string(&request).context("failed to serialize hook request")?;
+
+    let output = match plugin.call::<&str, String>("on_hook", &input) {
+        Ok(out) => out,
+        Err(e) if format!("{e}").contains("on_hook") => return Ok(None),
+        Err(e) => return Err(e).context("failed to call on_hook export"),
+    };
+
+    let response: HookInvokeResponse =
+        serde_json::from_str(&output).context("failed to parse on_hook JSON")?;
+    Ok(Some(response))
 }
 
 /// Call the `execute` export with the given args JSON and return a `ToolResult`.
