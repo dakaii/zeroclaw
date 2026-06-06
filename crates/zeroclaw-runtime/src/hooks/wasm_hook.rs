@@ -54,8 +54,12 @@ impl WasmHookHandler {
         let event_for_log = event.clone();
 
         let result = tokio::task::spawn_blocking(move || {
-            let mut plugin = zeroclaw_plugins::runtime::create_plugin(&wasm_path, &permissions)?;
-            zeroclaw_plugins::runtime::call_on_hook(&mut plugin, &event, payload)
+            zeroclaw_plugins::runtime::call_on_hook_pooled(
+                &wasm_path,
+                &permissions,
+                &event,
+                payload,
+            )
         })
         .await;
 
@@ -128,8 +132,12 @@ impl WasmHookHandler {
         let event_for_log = event_owned.clone();
 
         let result = tokio::task::spawn_blocking(move || {
-            let mut plugin = zeroclaw_plugins::runtime::create_plugin(&wasm_path, &permissions)?;
-            zeroclaw_plugins::runtime::call_on_hook(&mut plugin, &event_owned, payload)
+            zeroclaw_plugins::runtime::call_on_hook_pooled(
+                &wasm_path,
+                &permissions,
+                &event_owned,
+                payload,
+            )
         })
         .await;
 
@@ -212,5 +220,71 @@ impl HookHandler for WasmHookHandler {
         });
         self.invoke_void(HOOK_EVENT_ON_AFTER_TOOL_CALL, payload)
             .await;
+    }
+}
+
+#[cfg(all(test, feature = "plugins-wasm"))]
+mod integration_tests {
+    use super::*;
+    use crate::hooks::traits::HookHandler;
+    use std::path::PathBuf;
+
+    fn hook_test_wasm_path() -> Option<PathBuf> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../plugins/hook-test/hook_test.wasm");
+        if path.exists() { Some(path) } else { None }
+    }
+
+    #[tokio::test]
+    async fn wasm_hook_handler_invokes_on_turn_complete() {
+        let Some(wasm_path) = hook_test_wasm_path() else {
+            eprintln!("SKIP: hook_test.wasm not found (build plugins/hook-test first)");
+            return;
+        };
+
+        let handler = WasmHookHandler::new(
+            "hook-test".into(),
+            wasm_path,
+            vec![],
+            vec![HOOK_EVENT_ON_TURN_COMPLETE.to_string()],
+            0,
+        );
+
+        let summary = TurnCompleteSummary {
+            session_id: None,
+            channel: Some("cli".into()),
+            agent_alias: "default".into(),
+            user_message: "hi".into(),
+            final_response: "hello".into(),
+            tool_calls: vec![],
+            turn_duration_ms: 1,
+            success: true,
+        };
+
+        handler.on_turn_complete(&summary).await;
+        handler.on_turn_complete(&summary).await;
+    }
+
+    #[tokio::test]
+    async fn wasm_hook_handler_modifies_prompt_with_permission() {
+        let Some(wasm_path) = hook_test_wasm_path() else {
+            return;
+        };
+
+        let handler = WasmHookHandler::new(
+            "hook-test".into(),
+            wasm_path,
+            vec![PluginPermission::PromptModify],
+            vec![HOOK_EVENT_BEFORE_PROMPT_BUILD.to_string()],
+            0,
+        );
+
+        match handler.before_prompt_build("base".into()).await {
+            HookResult::Continue(prompt) => {
+                assert!(prompt.contains("base"));
+                assert!(prompt.contains("[hook-test]"));
+            }
+            HookResult::Cancel(_) => panic!("hook should not cancel"),
+        }
     }
 }

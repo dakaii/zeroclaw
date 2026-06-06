@@ -1240,6 +1240,7 @@ pub async fn agent_turn(
     model_switch_callback: Option<ModelSwitchCallback>,
     strict_tool_parsing: bool,
     parallel_tools: bool,
+    hooks: Option<&crate::hooks::HookRunner>,
     channel: Option<&dyn Channel>,
 ) -> Result<String> {
     run_tool_call_loop(
@@ -1258,7 +1259,7 @@ pub async fn agent_turn(
         max_tool_iterations,
         None,
         None,
-        None,
+        hooks,
         excluded_tools,
         dedup_exempt_tools,
         activated_tools,
@@ -1677,6 +1678,21 @@ pub async fn run_tool_call_loop(
             hooks.fire_llm_input(history, model).await;
         }
 
+        let mut llm_messages = prepared_messages.messages;
+        let mut llm_model = active_model.to_string();
+        if let Some(hooks) = hooks {
+            match hooks.run_before_llm_call(llm_messages, llm_model).await {
+                crate::hooks::HookResult::Continue((messages, model)) => {
+                    llm_messages = messages;
+                    llm_model = model;
+                }
+                crate::hooks::HookResult::Cancel(reason) => {
+                    anyhow::bail!("LLM call cancelled by hook: {reason}");
+                }
+            }
+        }
+        let active_model = llm_model.as_str();
+
         // Budget enforcement — block if limit exceeded (no-op when not scoped)
         if let Some(BudgetCheck::Exceeded {
             current_usd,
@@ -1725,7 +1741,7 @@ pub async fn run_tool_call_loop(
                 =>
                 consume_provider_streaming_response(
                     active_model_provider,
-                    &prepared_messages.messages,
+                    &llm_messages,
                     request_tools,
                     active_model,
                     temperature,
@@ -1773,7 +1789,7 @@ pub async fn run_tool_call_loop(
                             =>
                             active_model_provider.chat(
                                 ChatRequest {
-                                    messages: &prepared_messages.messages,
+                                    messages: &llm_messages,
                                     tools: request_tools,
                                     thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
                                         .try_with(Clone::clone)
@@ -1806,7 +1822,7 @@ pub async fn run_tool_call_loop(
                 =>
                 active_model_provider.chat(
                     ChatRequest {
-                        messages: &prepared_messages.messages,
+                        messages: &llm_messages,
                         tools: request_tools,
                         thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
                             .try_with(Clone::clone)
@@ -4638,6 +4654,8 @@ pub async fn process_message(
 
         let observer: Arc<dyn Observer> =
             Arc::from(observability::create_observer(&config.observability));
+        let hook_runner =
+            crate::hooks::build_hook_runner(&config.hooks, &config.plugins, &config.data_dir);
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
         let security = Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?);
@@ -5080,6 +5098,11 @@ pub async fn process_message(
             system_prompt = format!("{prefix}\n\n{system_prompt}");
         }
 
+        match crate::hooks::apply_before_prompt_build(hook_runner.as_deref(), system_prompt).await {
+            Ok(p) => system_prompt = p,
+            Err(reason) => return Ok(format!("Turn cancelled by hook: {reason}")),
+        }
+
         let effective_msg_ref = effective_message.as_str();
         if let Some(suggestion) = crate::skills::render_missing_skill_install_suggestion(
             effective_msg_ref,
@@ -5130,30 +5153,41 @@ pub async fn process_message(
             }
         }
 
+        let turn_hook_ctx = Some(crate::hooks::TurnHookContext {
+            agent_alias: agent_alias.to_string(),
+            user_message: effective_message.clone(),
+            channel: "daemon".to_string(),
+            loop_started_at: std::time::Instant::now(),
+        });
+
         zeroclaw_api::NATIVE_THINKING_OVERRIDE
             .scope(
                 thinking_params.native_thinking,
-                agent_turn(
-                    model_provider.as_ref(),
-                    &mut history,
-                    &tools_registry,
-                    observer.as_ref(),
-                    provider_name,
-                    &model_name,
-                    effective_temperature,
-                    true,
-                    "daemon",
-                    None,
-                    &config.multimodal,
-                    agent.resolved.max_tool_iterations,
-                    Some(&approval_manager),
-                    &excluded_tools,
-                    &agent.resolved.tool_call_dedup_exempt,
-                    activated_handle_pm.as_ref(),
-                    None,
-                    agent.resolved.strict_tool_parsing,
-                    agent.resolved.parallel_tools,
-                    None, // channel: process_message path has no channel ref
+                crate::hooks::TURN_HOOK_CONTEXT.scope(
+                    turn_hook_ctx,
+                    agent_turn(
+                        model_provider.as_ref(),
+                        &mut history,
+                        &tools_registry,
+                        observer.as_ref(),
+                        provider_name,
+                        &model_name,
+                        effective_temperature,
+                        true,
+                        "daemon",
+                        None,
+                        &config.multimodal,
+                        agent.resolved.max_tool_iterations,
+                        Some(&approval_manager),
+                        &excluded_tools,
+                        &agent.resolved.tool_call_dedup_exempt,
+                        activated_handle_pm.as_ref(),
+                        None,
+                        agent.resolved.strict_tool_parsing,
+                        agent.resolved.parallel_tools,
+                        hook_runner.as_deref(),
+                        None, // channel: process_message path has no channel ref
+                    ),
                 ),
             )
             .await
@@ -10225,6 +10259,7 @@ This is an example, not an invocation."#;
                 None,
                 false,
                 false, // parallel_tools
+                None,  // hooks
                 None,  // channel
             )
             .await
@@ -10291,6 +10326,7 @@ This is an example, not an invocation."#;
                 None,
                 true,
                 false, // parallel_tools
+                None,  // hooks
                 None,  // channel
             )
             .await

@@ -446,6 +446,48 @@ mod tests {
         assert_eq!(names, vec!["high", "mid", "low"]);
     }
 
+    /// A modifying hook that appends a suffix to the model name.
+    struct SuffixModelHook {
+        name: String,
+        priority: i32,
+        suffix: String,
+    }
+
+    #[async_trait]
+    impl HookHandler for SuffixModelHook {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn priority(&self) -> i32 {
+            self.priority
+        }
+        async fn before_llm_call(
+            &self,
+            messages: Vec<ChatMessage>,
+            model: String,
+        ) -> HookResult<(Vec<ChatMessage>, String)> {
+            HookResult::Continue((messages, format!("{}{}", model, self.suffix)))
+        }
+    }
+
+    #[tokio::test]
+    async fn before_llm_call_pipelines_model() {
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(SuffixModelHook {
+            name: "suffix".into(),
+            priority: 0,
+            suffix: "-hooked".into(),
+        }));
+
+        match runner
+            .run_before_llm_call(vec![ChatMessage::user("hi")], "gpt-4".into())
+            .await
+        {
+            HookResult::Continue((_, model)) => assert_eq!(model, "gpt-4-hooked"),
+            HookResult::Cancel(_) => panic!("should not cancel"),
+        }
+    }
+
     #[tokio::test]
     async fn on_turn_complete_fires_all_handlers() {
         let mut runner = HookRunner::new();

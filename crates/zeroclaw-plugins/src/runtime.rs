@@ -8,8 +8,10 @@ use crate::PluginPermission;
 use anyhow::{Context, Result};
 use extism::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::path::Path;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
 use zeroclaw_api::tool::ToolResult;
 
 // ── Host function context ─────────────────────────────────────────
@@ -211,6 +213,53 @@ pub fn create_plugin(wasm_path: &Path, permissions: &[PluginPermission]) -> Resu
 
     Plugin::new(manifest, [http_fn, env_fn], true)
         .with_context(|| format!("failed to load WASM plugin from {}", wasm_path.display()))
+}
+
+type PluginCacheKey = (PathBuf, u64);
+
+fn plugin_cache_key(wasm_path: &Path, permissions: &[PluginPermission]) -> PluginCacheKey {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    permissions.hash(&mut hasher);
+    (wasm_path.to_path_buf(), hasher.finish())
+}
+
+thread_local! {
+    static PLUGIN_CACHE: RefCell<HashMap<PluginCacheKey, Plugin>> = RefCell::new(HashMap::new());
+}
+
+/// Run a closure against a thread-local cached plugin instance for `wasm_path`.
+///
+/// Extism `Plugin` is `!Send`, so instances are pooled per OS thread inside
+/// `spawn_blocking` workers instead of reloading WASM on every hook call.
+pub fn with_pooled_plugin<R>(
+    wasm_path: &Path,
+    permissions: &[PluginPermission],
+    f: impl FnOnce(&mut Plugin) -> Result<R>,
+) -> Result<R> {
+    let key = plugin_cache_key(wasm_path, permissions);
+    PLUGIN_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if !cache.contains_key(&key) {
+            let plugin = create_plugin(wasm_path, permissions)?;
+            cache.insert(key.clone(), plugin);
+        }
+        let plugin = cache
+            .get_mut(&key)
+            .expect("plugin cache entry must exist after insert");
+        f(plugin)
+    })
+}
+
+/// Like [`call_on_hook`] but reuses a thread-local cached plugin instance.
+pub fn call_on_hook_pooled(
+    wasm_path: &Path,
+    permissions: &[PluginPermission],
+    event: &str,
+    payload: serde_json::Value,
+) -> Result<Option<HookInvokeResponse>> {
+    with_pooled_plugin(wasm_path, permissions, |plugin| {
+        call_on_hook(plugin, event, payload)
+    })
 }
 
 /// Call the `tool_metadata` export and parse the result.
@@ -415,6 +464,78 @@ mod tests {
 
         /// End-to-end permission enforcement: without `EnvRead`, the host
         /// function returns permission-denied and Extism propagates it as a trap.
+        fn hook_test_wasm_path() -> Option<std::path::PathBuf> {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../plugins/hook-test/hook_test.wasm");
+            if path.exists() { Some(path) } else { None }
+        }
+
+        #[test]
+        fn hook_test_on_turn_complete_increments_counter() {
+            let Some(path) = hook_test_wasm_path() else {
+                eprintln!("SKIP: hook_test.wasm not found (build plugins/hook-test first)");
+                return;
+            };
+            let perms: Vec<PluginPermission> = vec![];
+            let payload = serde_json::json!({
+                "agent_alias": "default",
+                "user_message": "hi",
+                "final_response": "hello",
+                "success": true,
+                "tool_calls": [],
+                "turn_duration_ms": 1
+            });
+
+            let first = call_on_hook_pooled(&path, &perms, "on_turn_complete", payload.clone())
+                .unwrap()
+                .unwrap();
+            let second = call_on_hook_pooled(&path, &perms, "on_turn_complete", payload)
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(
+                first
+                    .payload
+                    .as_ref()
+                    .and_then(|p| p.get("turn_count"))
+                    .and_then(|v| v.as_u64()),
+                Some(1)
+            );
+            assert_eq!(
+                second
+                    .payload
+                    .as_ref()
+                    .and_then(|p| p.get("turn_count"))
+                    .and_then(|v| v.as_u64()),
+                Some(2)
+            );
+        }
+
+        #[test]
+        fn hook_test_before_prompt_build_appends_marker() {
+            let Some(path) = hook_test_wasm_path() else {
+                return;
+            };
+            let perms = vec![PluginPermission::PromptModify];
+            let response = call_on_hook_pooled(
+                &path,
+                &perms,
+                "before_prompt_build",
+                serde_json::json!({ "prompt": "base prompt" }),
+            )
+            .unwrap()
+            .unwrap();
+
+            let prompt = response
+                .payload
+                .as_ref()
+                .and_then(|p| p.get("prompt"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            assert!(prompt.contains("base prompt"));
+            assert!(prompt.contains("[hook-test]"));
+        }
+
         #[test]
         fn execute_without_env_read_permission_fails() {
             let Some(path) = wasm_path() else { return };

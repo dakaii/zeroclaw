@@ -3566,6 +3566,14 @@ async fn process_channel_message_body(
             .is_some_and(|turns| !turns.is_empty())
     };
 
+    if !had_prior_history
+        && let Some(hooks) = ctx.hooks.as_deref()
+    {
+        hooks
+            .fire_session_start(&history_key, msg.channel.as_str())
+            .await;
+    }
+
     // Preserve the dated user turn before the LLM call so interrupted requests
     // keep the same temporal context as CLI turns.
     let timestamped_content = timestamp_channel_user_content(&msg.content);
