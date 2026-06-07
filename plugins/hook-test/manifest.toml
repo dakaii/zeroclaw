@@ -4,3 +4,4 @@ description = "Minimal lifecycle hook test fixture"
 wasm_path = "hook_test.wasm"
 capabilities = ["hook"]
 hooks = ["on_turn_complete", "before_prompt_build"]
+permissions = ["prompt_modify"]
