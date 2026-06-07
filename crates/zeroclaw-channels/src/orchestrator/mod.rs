@@ -3566,6 +3566,14 @@ async fn process_channel_message_body(
             .is_some_and(|turns| !turns.is_empty())
     };
 
+    if !had_prior_history
+        && let Some(hooks) = ctx.hooks.as_deref()
+    {
+        hooks
+            .fire_session_start(&history_key, msg.channel.as_str())
+            .await;
+    }
+
     // Preserve the dated user turn before the LLM call so interrupted requests
     // keep the same temporal context as CLI turns.
     let timestamped_content = timestamp_channel_user_content(&msg.content);
@@ -3691,6 +3699,20 @@ async fn process_channel_message_body(
         build_channel_system_prompt_for_message(&base_system_prompt, &msg, target_channel.as_ref());
     if !memory_context.is_empty() {
         let _ = write!(system_prompt, "\n\n{memory_context}");
+    }
+    if let Some(hooks) = ctx.hooks.as_deref() {
+        match zeroclaw_runtime::hooks::apply_before_prompt_build(Some(hooks), system_prompt).await {
+            Ok(p) => system_prompt = p,
+            Err(reason) => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"reason": reason})),
+                    "prompt build cancelled by hook"
+                );
+                return;
+            }
+        }
     }
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
@@ -4063,6 +4085,12 @@ async fn process_channel_message_body(
             collector: std::sync::Arc::clone(&tool_receipts_collector),
         }
     });
+    let turn_hook_ctx = Some(zeroclaw_runtime::hooks::TurnHookContext {
+        agent_alias: ctx.agent_alias.to_string(),
+        user_message: msg.content.clone(),
+        channel: msg.channel.clone(),
+        loop_started_at: started_at,
+    });
     let (llm_result, fallback_info) = scope_provider_fallback(async {
         let llm_result = loop {
             let loop_result = tokio::select! {
@@ -4079,6 +4107,8 @@ async fn process_channel_message_body(
                             cost_tracking_context.clone(),
                         zeroclaw_runtime::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT.scope(
                             receipt_scope.clone(),
+                        zeroclaw_runtime::hooks::TURN_HOOK_CONTEXT.scope(
+                            turn_hook_ctx.clone(),
                         run_tool_call_loop(
                         active_model_provider.as_ref(),
                         &mut history,
@@ -4124,6 +4154,7 @@ async fn process_channel_message_body(
                         ctx.receipt_generator
                             .as_ref()
                             .map(|_| tool_receipts_collector.as_ref()),
+                    ),
                     ),
                     ),
                     ),
@@ -8269,24 +8300,11 @@ pub async fn start_channels(
             media_pipeline: config.media_pipeline.clone(),
             transcription_config: config.transcription.clone(),
             agent_transcription_provider: agent.transcription_provider.as_str().to_string(),
-            hooks: if config.hooks.enabled {
-                let mut runner = zeroclaw_runtime::hooks::HookRunner::new();
-                if config.hooks.builtin.command_logger {
-                    runner.register(Box::new(
-                        zeroclaw_runtime::hooks::builtin::CommandLoggerHook::new(),
-                    ));
-                }
-                if config.hooks.builtin.webhook_audit.enabled {
-                    runner.register(Box::new(
-                        zeroclaw_runtime::hooks::builtin::WebhookAuditHook::new(
-                            config.hooks.builtin.webhook_audit.clone(),
-                        ),
-                    ));
-                }
-                Some(Arc::new(runner))
-            } else {
-                None
-            },
+            hooks: zeroclaw_runtime::hooks::build_hook_runner(
+                &config.hooks,
+                &config.plugins,
+                &config.data_dir,
+            ),
             non_cli_excluded_tools: Arc::new(risk_profile.excluded_tools.clone()),
             autonomy_level: risk_profile.level,
             tool_call_dedup_exempt: Arc::new(agent.resolved.tool_call_dedup_exempt.clone()),

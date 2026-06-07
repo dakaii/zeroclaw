@@ -13,6 +13,10 @@ pub mod wasm_tool;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+fn default_hook_priority() -> i32 {
+    -100
+}
+
 /// A plugin's declared manifest (loaded from manifest.toml alongside the .wasm).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginManifest {
@@ -34,6 +38,12 @@ pub struct PluginManifest {
     /// Permissions this plugin requests
     #[serde(default)]
     pub permissions: Vec<PluginPermission>,
+    /// Lifecycle hook events this plugin subscribes to (requires `Hook` capability).
+    #[serde(default)]
+    pub hooks: Vec<String>,
+    /// Priority for modifying hooks (lower runs later). Default: -100.
+    #[serde(default = "default_hook_priority")]
+    pub hook_priority: i32,
     /// Ed25519 signature over the canonical manifest (base64url-encoded).
     /// Set by the plugin publisher when signing the manifest.
     #[serde(default)]
@@ -57,6 +67,8 @@ pub enum PluginCapability {
     Observer,
     /// Provides one or more agentskills.io-format skills under `skills/`
     Skill,
+    /// Subscribes to agent lifecycle hooks via the `on_hook` WASM export
+    Hook,
 }
 
 /// Permissions a plugin may request.
@@ -75,6 +87,32 @@ pub enum PluginPermission {
     MemoryRead,
     /// Can write agent memory
     MemoryWrite,
+    /// Can modify prompts/messages via modifying lifecycle hooks
+    PromptModify,
+}
+
+/// Lifecycle hook event names a plugin may subscribe to in `manifest.toml`.
+pub const HOOK_EVENT_ON_TURN_COMPLETE: &str = "on_turn_complete";
+pub const HOOK_EVENT_BEFORE_PROMPT_BUILD: &str = "before_prompt_build";
+pub const HOOK_EVENT_ON_AFTER_TOOL_CALL: &str = "on_after_tool_call";
+
+/// All hook event names accepted in plugin manifests.
+pub const ALLOWED_HOOK_EVENTS: &[&str] = &[
+    HOOK_EVENT_ON_TURN_COMPLETE,
+    HOOK_EVENT_BEFORE_PROMPT_BUILD,
+    HOOK_EVENT_ON_AFTER_TOOL_CALL,
+];
+
+/// Returns an error message when `event` is not a supported hook subscription.
+pub fn validate_hook_event(event: &str) -> Result<(), String> {
+    if ALLOWED_HOOK_EVENTS.contains(&event) {
+        Ok(())
+    } else {
+        Err(format!(
+            "unknown hook event '{event}'; allowed: {}",
+            ALLOWED_HOOK_EVENTS.join(", ")
+        ))
+    }
 }
 
 /// Information about a loaded plugin.

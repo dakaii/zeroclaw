@@ -1356,20 +1356,11 @@ impl Agent {
             .security_summary(Some(security.prompt_summary()))
             .autonomy_level(risk_profile.level)
             .activated_tools(activated_tools)
-            .hook_runner(if config.hooks.enabled {
-                let mut runner = crate::hooks::HookRunner::new();
-                if config.hooks.builtin.command_logger {
-                    runner.register(Box::new(crate::hooks::builtin::CommandLoggerHook::new()));
-                }
-                if config.hooks.builtin.webhook_audit.enabled {
-                    runner.register(Box::new(crate::hooks::builtin::WebhookAuditHook::new(
-                        config.hooks.builtin.webhook_audit.clone(),
-                    )));
-                }
-                Some(Arc::new(runner))
-            } else {
-                None
-            })
+            .hook_runner(crate::hooks::build_hook_runner(
+                &config.hooks,
+                &config.plugins,
+                &config.data_dir,
+            ))
             .approval_manager(Some(Arc::new(approval_manager)))
             .build()?;
 
