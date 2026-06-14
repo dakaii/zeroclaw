@@ -1440,6 +1440,9 @@ pub async fn run(
                         .with_agent_alias(agent_alias)
                 });
 
+        let hook_runner =
+            crate::hooks::build_hook_runner(&config.hooks, &config.plugins, &config.data_dir);
+
         // ── Execute ──────────────────────────────────────────────────
         let start = Instant::now();
 
@@ -1549,6 +1552,14 @@ pub async fn run(
                 format!("{context}[{now}] {effective_msg}")
             };
 
+            if let Some(hooks) = hook_runner.as_deref() {
+                system_prompt = crate::hooks::apply_before_prompt_build(Some(hooks), system_prompt)
+                    .await
+                    .map_err(|reason| {
+                        anyhow::Error::msg(format!("Turn cancelled by hook: {reason}"))
+                    })?;
+            }
+
             let mut history = vec![
                 ChatMessage::system(&system_prompt),
                 ChatMessage::user(&enriched),
@@ -1577,41 +1588,49 @@ pub async fn run(
                         thinking_params.native_thinking,
                         TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                             cost_tracking_context.clone(),
-                            run_tool_call_loop(
-                                model_provider.as_ref(),
-                                &mut history,
-                                &tools_registry,
-                                observer.as_ref(),
-                                &provider_name,
-                                &model_name,
-                                effective_temperature,
-                                false,
-                                approval_manager.as_ref(),
-                                channel_name,
-                                None,
-                                &config.multimodal,
-                                agent.resolved.max_tool_iterations,
-                                None,
-                                None,
-                                None,
-                                &excluded_tools,
-                                &agent.resolved.tool_call_dedup_exempt,
-                                activated_handle.as_ref(),
-                                Some(model_switch_callback.clone()),
-                                &config.pacing,
-                                agent.resolved.strict_tool_parsing,
-                                agent.resolved.parallel_tools,
-                                agent.resolved.max_tool_result_chars,
-                                agent.resolved.max_context_tokens,
-                                None, // shared_budget
-                                None, // channel: CLI mode — uses prompt_cli
-                                None, // receipt_generator
-                                None, // collected_receipts
-                                None, // event_tx
-                                None, // steering
-                                None, // new_messages_out
-                                &LoopKnobs::default(),
-                                None,
+                            crate::hooks::TURN_HOOK_CONTEXT.scope(
+                                Some(crate::hooks::TurnHookContext {
+                                    agent_alias: agent_alias.to_string(),
+                                    user_message: effective_msg.clone(),
+                                    channel: channel_name.to_string(),
+                                    loop_started_at: std::time::Instant::now(),
+                                }),
+                                run_tool_call_loop(
+                                    model_provider.as_ref(),
+                                    &mut history,
+                                    &tools_registry,
+                                    observer.as_ref(),
+                                    &provider_name,
+                                    &model_name,
+                                    effective_temperature,
+                                    false,
+                                    approval_manager.as_ref(),
+                                    channel_name,
+                                    None,
+                                    &config.multimodal,
+                                    agent.resolved.max_tool_iterations,
+                                    None,
+                                    None,
+                                    hook_runner.as_deref(),
+                                    &excluded_tools,
+                                    &agent.resolved.tool_call_dedup_exempt,
+                                    activated_handle.as_ref(),
+                                    Some(model_switch_callback.clone()),
+                                    &config.pacing,
+                                    agent.resolved.strict_tool_parsing,
+                                    agent.resolved.parallel_tools,
+                                    agent.resolved.max_tool_result_chars,
+                                    agent.resolved.max_context_tokens,
+                                    None, // shared_budget
+                                    None, // channel: CLI mode — uses prompt_cli
+                                    None, // receipt_generator
+                                    None, // collected_receipts
+                                    None, // event_tx
+                                    None, // steering
+                                    None, // new_messages_out
+                                    &LoopKnobs::default(),
+                                    None,
+                                ),
                             ),
                         ),
                     )

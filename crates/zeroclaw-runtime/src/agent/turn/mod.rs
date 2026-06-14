@@ -195,6 +195,7 @@ pub async fn run_tool_call_loop(
 
     let turn_id = Uuid::new_v4().to_string();
     let loop_started_at = Instant::now();
+    let mut turn_tool_records: Vec<crate::hooks::TurnToolCallRecord> = Vec::new();
     let loop_ignore_tools: HashSet<&str> = pacing
         .loop_ignore_tools
         .iter()
@@ -522,6 +523,13 @@ pub async fn run_tool_call_loop(
                 out.push(msg.clone());
             }
             history.push(msg);
+            crate::hooks::fire_turn_complete(
+                hooks,
+                &turn_tool_records,
+                &accumulated_display_text,
+                false,
+            )
+            .await;
             return Ok(accumulated_display_text);
         }
 
@@ -575,6 +583,13 @@ pub async fn run_tool_call_loop(
                 out.push(msg.clone());
             }
             history.push(msg);
+            crate::hooks::fire_turn_complete(
+                hooks,
+                &turn_tool_records,
+                &accumulated_display_text,
+                true,
+            )
+            .await;
             return Ok(accumulated_display_text);
         }
 
@@ -661,6 +676,16 @@ pub async fn run_tool_call_loop(
         // finished; the executed prefix when cancelled mid-batch — the
         // sequential executor returns completed outcomes in call order).
         let completed = executed_outcomes.len();
+        for (call, outcome) in executable_calls[..completed]
+            .iter()
+            .zip(executed_outcomes.iter())
+        {
+            turn_tool_records.push(crate::hooks::TurnToolCallRecord {
+                name: call.name.clone(),
+                success: outcome.success,
+                duration_ms: u64::try_from(outcome.duration.as_millis()).unwrap_or(u64::MAX),
+            });
+        }
         record_executed_outcomes(
             &ctx,
             &executable_indices[..completed],
@@ -738,7 +763,7 @@ pub async fn run_tool_call_loop(
         }
     }
 
-    finish_after_max_iterations(
+    let result = finish_after_max_iterations(
         model_provider,
         history,
         provider_name,
@@ -752,5 +777,9 @@ pub async fn run_tool_call_loop(
         knobs,
         new_messages_out,
     )
-    .await
+    .await;
+    if let Ok(ref text) = result {
+        crate::hooks::fire_turn_complete(hooks, &turn_tool_records, text, true).await;
+    }
+    result
 }

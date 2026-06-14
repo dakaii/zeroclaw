@@ -1397,20 +1397,11 @@ impl Agent {
             .security_summary(Some(security.prompt_summary()))
             .autonomy_level(risk_profile.level)
             .activated_tools(activated_tools)
-            .hook_runner(if config.hooks.enabled {
-                let mut runner = crate::hooks::HookRunner::new();
-                if config.hooks.builtin.command_logger {
-                    runner.register(Box::new(crate::hooks::builtin::CommandLoggerHook::new()));
-                }
-                if config.hooks.builtin.webhook_audit.enabled {
-                    runner.register(Box::new(crate::hooks::builtin::WebhookAuditHook::new(
-                        config.hooks.builtin.webhook_audit.clone(),
-                    )));
-                }
-                Some(Arc::new(runner))
-            } else {
-                None
-            })
+            .hook_runner(crate::hooks::build_hook_runner(
+                &config.hooks,
+                &config.plugins,
+                &config.data_dir,
+            ))
             .approval_manager(Some(Arc::new(approval_manager)))
             .build()?;
 
@@ -1764,6 +1755,15 @@ impl Agent {
 
         if self.history.is_empty() {
             let system_prompt = self.build_system_prompt()?;
+            let system_prompt = if let Some(hooks) = self.hook_runner.as_deref() {
+                crate::hooks::apply_before_prompt_build(Some(hooks), system_prompt)
+                    .await
+                    .map_err(|reason| {
+                        anyhow::Error::msg(format!("Turn cancelled by hook: {reason}"))
+                    })?
+            } else {
+                system_prompt
+            };
             self.history
                 .push(ConversationMessage::Chat(ChatMessage::system(
                     system_prompt,
@@ -1883,41 +1883,49 @@ impl Agent {
         let loop_result = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(
                 Some(cost_context.clone()),
-                crate::agent::loop_::run_tool_call_loop(
-                    self.model_provider.as_ref(),
-                    &mut loop_history,
-                    &self.tools,
-                    self.observer.as_ref(),
-                    &self.model_provider_name,
-                    &effective_model,
-                    self.temperature,
-                    false,
-                    self.approval_manager.as_deref(),
-                    "cli",
-                    None,
-                    &self.multimodal_config,
-                    self.config.resolved.max_tool_iterations,
-                    None,
-                    None,
-                    self.hook_runner.as_deref(),
-                    &[],
-                    &self.config.resolved.tool_call_dedup_exempt,
-                    self.activated_tools.as_ref(),
-                    None,
-                    &pacing,
-                    self.config.resolved.strict_tool_parsing,
-                    self.config.resolved.parallel_tools,
-                    self.config.resolved.max_tool_result_chars,
-                    self.config.resolved.max_context_tokens,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(&mut loop_new_messages),
-                    &knobs,
-                    Some(&mut self.image_cache),
+                crate::hooks::TURN_HOOK_CONTEXT.scope(
+                    Some(crate::hooks::TurnHookContext {
+                        agent_alias: self.agent_alias.clone(),
+                        user_message: user_message.to_string(),
+                        channel: "cli".to_string(),
+                        loop_started_at: std::time::Instant::now(),
+                    }),
+                    crate::agent::loop_::run_tool_call_loop(
+                        self.model_provider.as_ref(),
+                        &mut loop_history,
+                        &self.tools,
+                        self.observer.as_ref(),
+                        &self.model_provider_name,
+                        &effective_model,
+                        self.temperature,
+                        false,
+                        self.approval_manager.as_deref(),
+                        "cli",
+                        None,
+                        &self.multimodal_config,
+                        self.config.resolved.max_tool_iterations,
+                        None,
+                        None,
+                        self.hook_runner.as_deref(),
+                        &[],
+                        &self.config.resolved.tool_call_dedup_exempt,
+                        self.activated_tools.as_ref(),
+                        None,
+                        &pacing,
+                        self.config.resolved.strict_tool_parsing,
+                        self.config.resolved.parallel_tools,
+                        self.config.resolved.max_tool_result_chars,
+                        self.config.resolved.max_context_tokens,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(&mut loop_new_messages),
+                        &knobs,
+                        Some(&mut self.image_cache),
+                    ),
                 ),
             )
             .await;
@@ -2136,6 +2144,17 @@ impl Agent {
                     committed_response: String::new(),
                     new_messages: Vec::new(),
                 })?;
+            let system_prompt = if let Some(hooks) = self.hook_runner.as_deref() {
+                crate::hooks::apply_before_prompt_build(Some(hooks), system_prompt)
+                    .await
+                    .map_err(|reason| StreamedTurnError {
+                        error: anyhow::Error::msg(format!("Turn cancelled by hook: {reason}")),
+                        committed_response: String::new(),
+                        new_messages: Vec::new(),
+                    })?
+            } else {
+                system_prompt
+            };
             self.history
                 .push(ConversationMessage::Chat(ChatMessage::system(
                     system_prompt,
@@ -2271,41 +2290,49 @@ impl Agent {
             let loop_result = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
                 .scope(
                     Some(cost_context.clone()),
-                    crate::agent::loop_::run_tool_call_loop(
-                        self.model_provider.as_ref(),
-                        &mut loop_history,
-                        &self.tools,
-                        self.observer.as_ref(),
-                        &self.model_provider_name,
-                        &effective_model,
-                        self.temperature,
-                        true,
-                        self.approval_manager.as_deref(),
-                        "cli",
-                        None,
-                        &self.multimodal_config,
-                        self.config.resolved.max_tool_iterations,
-                        cancel_token.clone(),
-                        None,
-                        self.hook_runner.as_deref(),
-                        &[],
-                        &self.config.resolved.tool_call_dedup_exempt,
-                        self.activated_tools.as_ref(),
-                        None,
-                        &pacing,
-                        self.config.resolved.strict_tool_parsing,
-                        self.config.resolved.parallel_tools,
-                        self.config.resolved.max_tool_result_chars,
-                        self.config.resolved.max_context_tokens,
-                        None,
-                        approval_bridge.as_deref(),
-                        None,
-                        None,
-                        Some(event_tx.clone()),
-                        None,
-                        Some(&mut round_added),
-                        &knobs,
-                        Some(&mut self.image_cache),
+                    crate::hooks::TURN_HOOK_CONTEXT.scope(
+                        Some(crate::hooks::TurnHookContext {
+                            agent_alias: self.agent_alias.clone(),
+                            user_message: user_message.to_string(),
+                            channel: "cli".to_string(),
+                            loop_started_at: std::time::Instant::now(),
+                        }),
+                        crate::agent::loop_::run_tool_call_loop(
+                            self.model_provider.as_ref(),
+                            &mut loop_history,
+                            &self.tools,
+                            self.observer.as_ref(),
+                            &self.model_provider_name,
+                            &effective_model,
+                            self.temperature,
+                            true,
+                            self.approval_manager.as_deref(),
+                            "cli",
+                            None,
+                            &self.multimodal_config,
+                            self.config.resolved.max_tool_iterations,
+                            cancel_token.clone(),
+                            None,
+                            self.hook_runner.as_deref(),
+                            &[],
+                            &self.config.resolved.tool_call_dedup_exempt,
+                            self.activated_tools.as_ref(),
+                            None,
+                            &pacing,
+                            self.config.resolved.strict_tool_parsing,
+                            self.config.resolved.parallel_tools,
+                            self.config.resolved.max_tool_result_chars,
+                            self.config.resolved.max_context_tokens,
+                            None,
+                            approval_bridge.as_deref(),
+                            None,
+                            None,
+                            Some(event_tx.clone()),
+                            None,
+                            Some(&mut round_added),
+                            &knobs,
+                            Some(&mut self.image_cache),
+                        ),
                     ),
                 )
                 .await;

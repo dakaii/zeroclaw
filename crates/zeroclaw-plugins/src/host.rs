@@ -2,7 +2,7 @@
 
 use super::error::PluginError;
 use super::signature::{self, SignatureMode, VerificationResult};
-use super::{PluginCapability, PluginInfo, PluginManifest};
+use super::{PluginCapability, PluginInfo, PluginManifest, validate_hook_event};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -277,6 +277,18 @@ impl PluginHost {
             .collect()
     }
 
+    /// Hook-capable plugins with resolved WASM paths and subscribed events.
+    pub fn hook_plugin_details(&self) -> Vec<(&PluginManifest, &Path, Vec<String>)> {
+        self.loaded
+            .values()
+            .filter(|p| p.manifest.capabilities.contains(&PluginCapability::Hook))
+            .filter_map(|p| {
+                let wasm = p.wasm_path.as_deref()?;
+                Some((&p.manifest, wasm, p.manifest.hooks.clone()))
+            })
+            .collect()
+    }
+
     /// Get skill-capable plugins paired with the absolute path to their `skills/`
     /// directory. Plugins without an existing `skills/` subdirectory are skipped.
     ///
@@ -348,6 +360,29 @@ fn validate_manifest_shape(
 
     if manifest.capabilities.contains(&PluginCapability::Skill) {
         validate_skill_bundle(&manifest.name, plugin_dir)?;
+    }
+
+    if manifest.capabilities.contains(&PluginCapability::Hook) {
+        if manifest.hooks.is_empty() {
+            return Err(PluginError::InvalidManifest(format!(
+                "hook plugin '{}' must declare at least one entry in `hooks = [...]`",
+                manifest.name
+            )));
+        }
+        for event in &manifest.hooks {
+            validate_hook_event(event).map_err(PluginError::InvalidManifest)?;
+        }
+        if manifest
+            .capabilities
+            .iter()
+            .any(|c| matches!(c, PluginCapability::Tool | PluginCapability::Channel))
+            && manifest.wasm_path.is_none()
+        {
+            return Err(PluginError::InvalidManifest(format!(
+                "hook plugin '{}' with additional capabilities requires `wasm_path`",
+                manifest.name
+            )));
+        }
     }
 
     Ok(())
@@ -730,5 +765,70 @@ capabilities = ["tool"]
         assert!(host.tool_plugin_details().is_empty());
         assert!(host.channel_plugins().is_empty());
         assert_eq!(host.skill_plugins().len(), 1);
+    }
+
+    #[test]
+    fn test_hook_plugin_discovers_with_subscribed_events() {
+        let dir = tempdir().unwrap();
+        let plugin_dir = dir.path().join("plugins").join("turn-reviewer");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            r#"
+name = "turn-reviewer"
+version = "0.1.0"
+wasm_path = "hook.wasm"
+capabilities = ["hook"]
+hooks = ["on_turn_complete"]
+"#,
+        )
+        .unwrap();
+
+        let host = PluginHost::new(dir.path()).unwrap();
+        let details = host.hook_plugin_details();
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].0.name, "turn-reviewer");
+        assert_eq!(details[0].2, vec!["on_turn_complete".to_string()]);
+    }
+
+    #[test]
+    fn test_hook_plugin_without_hooks_list_is_rejected() {
+        let dir = tempdir().unwrap();
+        let plugin_dir = dir.path().join("plugins").join("empty-hooks");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            r#"
+name = "empty-hooks"
+version = "0.1.0"
+wasm_path = "hook.wasm"
+capabilities = ["hook"]
+"#,
+        )
+        .unwrap();
+
+        let host = PluginHost::new(dir.path()).unwrap();
+        assert!(host.list_plugins().is_empty());
+    }
+
+    #[test]
+    fn test_hook_plugin_rejects_unknown_event() {
+        let dir = tempdir().unwrap();
+        let plugin_dir = dir.path().join("plugins").join("bad-event");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            r#"
+name = "bad-event"
+version = "0.1.0"
+wasm_path = "hook.wasm"
+capabilities = ["hook"]
+hooks = ["on_gateway_start"]
+"#,
+        )
+        .unwrap();
+
+        let host = PluginHost::new(dir.path()).unwrap();
+        assert!(host.list_plugins().is_empty());
     }
 }
