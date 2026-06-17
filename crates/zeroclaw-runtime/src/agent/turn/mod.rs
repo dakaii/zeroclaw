@@ -612,8 +612,8 @@ pub async fn run_tool_call_loop(
                 let _ = tx.send(StreamDelta::Text(narration)).await;
             }
             if !silent {
-                print!("{display_text}");
-                let _ = std::io::stdout().flush();
+                eprint!("{display_text}");
+                let _ = std::io::stderr().flush();
             }
         }
 
