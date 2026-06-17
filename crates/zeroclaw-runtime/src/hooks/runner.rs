@@ -9,6 +9,7 @@ use zeroclaw_api::model_provider::{ChatMessage, ChatResponse};
 use zeroclaw_api::tool::ToolResult;
 
 use super::traits::{HookHandler, HookResult};
+use super::types::TurnCompleteSummary;
 
 /// Dispatcher that manages registered hook handlers.
 ///
@@ -117,6 +118,15 @@ impl HookRunner {
             .handlers
             .iter()
             .map(|h| h.on_heartbeat_tick())
+            .collect();
+        join_all(futs).await;
+    }
+
+    pub async fn fire_on_turn_complete(&self, summary: &TurnCompleteSummary) {
+        let futs: Vec<_> = self
+            .handlers
+            .iter()
+            .map(|h| h.on_turn_complete(summary))
             .collect();
         join_all(futs).await;
     }
@@ -353,6 +363,9 @@ mod tests {
             self.priority
         }
         async fn on_heartbeat_tick(&self) {
+            self.fire_count.fetch_add(1, Ordering::SeqCst);
+        }
+        async fn on_turn_complete(&self, _summary: &TurnCompleteSummary) {
             self.fire_count.fetch_add(1, Ordering::SeqCst);
         }
     }

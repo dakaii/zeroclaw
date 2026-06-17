@@ -1,10 +1,32 @@
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
 
 use crate::channel::ChannelMessage;
 use crate::model_provider::{ChatMessage, ChatResponse};
 use crate::tool::ToolResult;
+
+/// Summary of a completed agent turn, passed to `on_turn_complete` hooks.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TurnCompleteSummary {
+    pub session_id: Option<String>,
+    pub channel: Option<String>,
+    pub agent_alias: String,
+    pub user_message: String,
+    pub final_response: String,
+    pub tool_calls: Vec<TurnToolCallRecord>,
+    pub turn_duration_ms: u64,
+    pub success: bool,
+}
+
+/// Minimal tool-call record for hook payloads (no raw arguments — may contain secrets).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TurnToolCallRecord {
+    pub name: String,
+    pub success: bool,
+    pub duration_ms: u64,
+}
 
 /// Result of a modifying hook — continue with (possibly modified) data, or cancel.
 #[derive(Debug, Clone)]
@@ -38,6 +60,7 @@ pub trait HookHandler: Send + Sync {
     async fn on_after_tool_call(&self, _tool: &str, _result: &ToolResult, _duration: Duration) {}
     async fn on_message_sent(&self, _channel: &str, _recipient: &str, _content: &str) {}
     async fn on_heartbeat_tick(&self) {}
+    async fn on_turn_complete(&self, _summary: &TurnCompleteSummary) {}
 
     // --- Modifying hooks (sequential by priority, can cancel) ---
     async fn before_model_resolve(
