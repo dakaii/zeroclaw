@@ -99,7 +99,7 @@ async fn wasm_hook_plugin_mutates_system_prompt_in_agent_run() {
         AliasedAgentConfig {
             enabled: true,
             model_provider: format!("{provider_type}.default").into(),
-            risk_profile: "default".to_string(),
+            risk_profile: "default".into(),
             ..Default::default()
         },
     );
