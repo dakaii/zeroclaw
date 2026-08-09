@@ -425,8 +425,8 @@ doas podman pull --os linux --arch amd64 ghcr.io/zeroclaw-labs/zeroclaw:debian
 
 </div>
 
-> Use the `debian` tag rather than `latest`: the distroless `latest` image has no
-> shell, which makes it awkward to debug under emulation. See
+> Use the `debian` tag rather than `latest`: the distroless `latest` image only
+> ships a minimal `/bin/sh` and is awkward to debug under emulation. See
 > [Docker & Containers](./container.md) for the full image list.
 
 ### 3. Run the container

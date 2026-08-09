@@ -13,7 +13,7 @@ services:
     # For ARM64 environments where the distroless image exits immediately,
     # switch to the Debian compatibility image instead:
     # image: ghcr.io/zeroclaw-labs/zeroclaw:debian
-    # Or build locally (distroless, no shell):
+    # Or build locally (distroless; minimal /bin/sh for runtime.shell):
     # build: .
     # Or build the Debian variant (includes bash, git, curl):
     # build:

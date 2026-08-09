@@ -12,7 +12,7 @@ Pushed to GitHub Container Registry (`ghcr.io`) on every stable release:
 
 Multi-arch: `linux/amd64`, `linux/arm64`.
 
-> **Note on shell access:** The default `latest` image is intentionally distroless and does not include `sh`, `ash`, or `bash`. Use the `debian` tag if you need a shell inside the container (for example, to run `docker exec` for debugging).
+> **Note on shell access:** The default `latest` image is distroless and has no package manager or interactive login shell. It does ship a minimal `/bin/sh` (`dash`) so the native runtime's default `runtime.shell = "sh"` validates and agent/webhook turns can run. Use the `debian` tag when you need `bash`, `git`, `curl`, or `docker exec` debugging.
 
 ## Alpine image (local build)
 
@@ -228,7 +228,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Container]
-# Pin a release in production; :latest is distroless (no shell — use :debian to exec a shell).
+# Pin a release in production; :latest is distroless (minimal /bin/sh only — use :debian to exec bash).
 Image=ghcr.io/zeroclaw-labs/zeroclaw:latest
 ContainerName=zeroclaw
 PublishPort=42617:42617

@@ -169,6 +169,32 @@ fn containerfile_serializes_shared_cargo_caches() {
 }
 
 #[test]
+fn distroless_release_ships_bin_sh_from_dash() {
+    // Regression for zeroclaw-labs/zeroclaw#9859: without `/bin/sh`, default
+    // `runtime.shell = "sh"` fails PATH validation and webhook/agent turns
+    // surface as `{"error":"LLM request failed"}`.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for name in ["Dockerfile", "Dockerfile.ci"] {
+        let text = fs::read_to_string(root.join(name))
+            .unwrap_or_else(|error| panic!("failed to read {name}: {error}"));
+        assert!(
+            text.contains("AS debian-shell"),
+            "{name} must declare a named debian-shell stage (BuildKit cannot COPY --from=${{ARG}})"
+        );
+        assert!(
+            text.contains("COPY --from=debian-shell /bin/dash /bin/sh"),
+            "{name} must copy dash to /bin/sh for NativeRuntime default shell"
+        );
+        assert!(
+            text.contains(
+                "ENV PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\""
+            ),
+            "{name} must put /bin on PATH so bare `sh` resolves"
+        );
+    }
+}
+
+#[test]
 fn cargo_cache_guard_parses_option_order_and_exact_values() {
     let mounts = cargo_cache_mounts(
         "RUN --mount=type=cache,id=registry,target=/root/.cargo/registry cargo fetch\n\

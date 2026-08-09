@@ -19,10 +19,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
     && rm -rf /var/lib/apt/lists/*
 
+# Named stage for `/bin/dash` — BuildKit does not expand `COPY --from=${ARG}`.
+# Distroless needs `/bin/sh` so default `runtime.shell = "sh"` validates and
+# webhook/agent turns can construct NativeRuntime (#9859). Harmless on debian.
+FROM debian:bookworm-slim AS debian-shell
+
 # ── Runtime ──────────────────────────────────────────────────
 FROM base-${VARIANT} AS runtime
 
 ARG TARGETARCH
+
+# Minimal POSIX `/bin/sh` for the native runtime (dash). Required on distroless;
+# on the debian variant this replaces the existing `/bin/sh` symlink/target.
+COPY --from=debian-shell /bin/dash /bin/sh
 
 # Copy the pre-built binary for this platform (amd64 or arm64)
 COPY bin/${TARGETARCH}/zeroclaw /usr/local/bin/zeroclaw
@@ -42,6 +51,7 @@ ENV LANG=C.UTF-8
 ENV ZEROCLAW_DATA_DIR=/zeroclaw-data/data
 ENV HOME=/zeroclaw-data
 ENV ZEROCLAW_GATEWAY_PORT=42617
+ENV PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 WORKDIR /zeroclaw-data
 USER 65534:65534

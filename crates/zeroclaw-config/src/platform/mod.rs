@@ -234,6 +234,29 @@ mod tests {
         );
     }
 
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[test]
+    fn create_runtime_surfaces_missing_shell_path_error() {
+        // Mirrors the distroless symptom in zeroclaw-labs/zeroclaw#9859:
+        // `runtime.shell "sh" was not found on PATH` → webhook
+        // `{"error":"LLM request failed"}`. Keep the message stable so
+        // operators (and this regression) can grep logs for it.
+        let cfg = RuntimeConfig {
+            kind: RuntimeKind::Native,
+            shell: Some("zc-no-such-shell-on-path".into()),
+            ..RuntimeConfig::default()
+        };
+        let err = match create_runtime(&cfg) {
+            Ok(_) => panic!("missing shell must fail create_runtime"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("runtime.shell \"zc-no-such-shell-on-path\" was not found on PATH"),
+            "create_runtime must surface the PATH validation error operators grep for; got: {msg}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn validate_shell_rejects_nonexecutable_file() {
