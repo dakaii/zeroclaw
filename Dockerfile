@@ -274,8 +274,23 @@ HEALTHCHECK --interval=60s --timeout=10s --retries=3 --start-period=10s \
 ENTRYPOINT ["zeroclaw"]
 CMD ["daemon"]
 
+# Minimal Debian stage used only as a COPY source for `/bin/dash`.
+# BuildKit does not expand `COPY --from=${ARG}`, so the shell must come from a
+# named stage (not directly from `${ZEROCLAW_BASE_DEBIAN}`).
+#
+# Distroless has no shell. The native runtime defaults `runtime.shell` to `"sh"`
+# and validates it on PATH before agent turns (webhook/chat). Without `/bin/sh`,
+# those turns fail with `runtime.shell "sh" was not found on PATH` even when the
+# turn does not need the shell tool (zeroclaw-labs/zeroclaw#9859).
+FROM ${ZEROCLAW_BASE_DEBIAN} AS debian-shell
+
 # ── Stage 3: Production Runtime (Distroless) ─────────────────
 FROM ${ZEROCLAW_BASE_DISTROLESS} AS release
+
+# Provide `/bin/sh` for NativeRuntime (default `runtime.shell = "sh"`).
+# `dash` is Essential on Debian and keeps the attack surface far smaller than
+# shipping bash + a package manager (still use `:debian` for interactive debug).
+COPY --from=debian-shell /bin/dash /bin/sh
 
 COPY --from=builder /app/zeroclaw /usr/local/bin/zeroclaw
 COPY --from=builder /app/zerocode /usr/local/bin/zerocode
@@ -293,6 +308,8 @@ ENV HOME=/zeroclaw-data
 # so config file edits are not silently overridden
 #ENV PROVIDER=
 ENV ZEROCLAW_GATEWAY_PORT=42617
+# Ensure bare `sh` (default runtime.shell) resolves to the dash we copied.
+ENV PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # API_KEY must be provided at runtime!
 

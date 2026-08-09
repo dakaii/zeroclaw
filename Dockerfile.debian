@@ -35,9 +35,10 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
 
 # Dockerfile.debian — Shell-equipped variant of the ZeroClaw container.
 #
-# The default Dockerfile produces a distroless "release" image with no shell,
-# which is ideal for minimal attack surface but prevents the agent from using
-# shell-based tools (pwd, ls, git, curl, etc.).
+# The default Dockerfile produces a distroless "release" image with a minimal
+# `/bin/sh` (dash) for NativeRuntime validation, but no bash/package manager /
+# extra CLI tools. Prefer this Debian variant when the agent needs git, curl,
+# or a fuller shell tool surface.
 #
 # This variant uses debian:bookworm-slim as the runtime base and ships
 # essential CLI tools so the agent can operate as a full coding assistant.
