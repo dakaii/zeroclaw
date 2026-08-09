@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
+use postgres::config::SslMode;
 use postgres::{Client, NoTls, Row};
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,6 +15,40 @@ use zeroclaw_api::session_keys::sanitize_session_key;
 
 /// Maximum allowed connect timeout (seconds) to avoid unreasonable waits.
 const POSTGRES_CONNECT_TIMEOUT_CAP_SECS: u64 = 300;
+
+/// Build a rustls connector with webpki trust anchors (public CAs).
+///
+/// Used whenever the connection URL's `sslmode` is not `disable`. Managed
+/// Postgres (Neon, Azure Flexible Server, Supabase, …) typically requires
+/// TLS; local compose/CI can set `sslmode=disable` to keep plaintext.
+fn make_rustls_connector() -> tokio_postgres_rustls::MakeRustlsConnect {
+    let root_store: rustls::RootCertStore =
+        webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect();
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    tokio_postgres_rustls::MakeRustlsConnect::new(tls_config)
+}
+
+/// Human-readable `sslmode` label for logs and tests.
+fn ssl_mode_label(mode: SslMode) -> &'static str {
+    match mode {
+        SslMode::Disable => "disable",
+        SslMode::Prefer => "prefer",
+        SslMode::Require => "require",
+        // tokio-postgres marks SslMode #[non_exhaustive]; keep a stable fallback.
+        _ => "unknown",
+    }
+}
+
+/// Whether connect should pass a real TLS connector (vs `NoTls`).
+///
+/// `Prefer` and `Require` need a TLS stack so the handshake can succeed when
+/// the server offers/requires SSL. `Disable` stays on `NoTls` for local
+/// Postgres without TLS.
+fn ssl_mode_needs_tls_connector(mode: SslMode) -> bool {
+    !matches!(mode, SslMode::Disable)
+}
 
 struct DropOnThread<T: Send + 'static>(Option<T>);
 
@@ -135,9 +170,39 @@ impl PostgresMemory {
                     config.connect_timeout(Duration::from_secs(bounded));
                 }
 
-                let mut client = config
-                    .connect(NoTls)
-                    .context("failed to connect to PostgreSQL memory backend")?;
+                let ssl_mode = config.get_ssl_mode();
+                let ssl_label = ssl_mode_label(ssl_mode);
+                let use_tls = ssl_mode_needs_tls_connector(ssl_mode);
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Connect)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "postgres memory connecting (sslmode={ssl_label}, tls_connector={use_tls})"
+                );
+
+                let mut client = if use_tls {
+                    config.connect(make_rustls_connector()).with_context(|| {
+                        format!(
+                            "failed to connect to PostgreSQL memory backend \
+                                 (sslmode={ssl_label}; managed Postgres usually needs \
+                                 sslmode=require and a hostname covered by a public CA)"
+                        )
+                    })?
+                } else {
+                    config.connect(NoTls).with_context(|| {
+                        format!(
+                            "failed to connect to PostgreSQL memory backend \
+                             (sslmode={ssl_label})"
+                        )
+                    })?
+                };
+
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Connect)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Success),
+                    "postgres memory connected (sslmode={ssl_label}, tls_connector={use_tls})"
+                );
 
                 Self::init_schema(&mut client, &schema_ident, &qualified_table)?;
                 zeroclaw_config::schema::v2::migrate_postgres_memory_to_v3(
@@ -925,6 +990,87 @@ mod tests {
         assert!(
             outcome.unwrap().is_err(),
             "PostgresMemory::new should return a connect error for an unreachable endpoint"
+        );
+    }
+
+    #[test]
+    fn ssl_mode_from_url_honors_sslmode_query() {
+        let require: postgres::Config = "postgres://u:p@db.example/db?sslmode=require"
+            .parse()
+            .unwrap();
+        assert_eq!(require.get_ssl_mode(), SslMode::Require);
+        assert!(ssl_mode_needs_tls_connector(require.get_ssl_mode()));
+        assert_eq!(ssl_mode_label(require.get_ssl_mode()), "require");
+
+        let disable: postgres::Config = "postgres://u:p@127.0.0.1/db?sslmode=disable"
+            .parse()
+            .unwrap();
+        assert_eq!(disable.get_ssl_mode(), SslMode::Disable);
+        assert!(!ssl_mode_needs_tls_connector(disable.get_ssl_mode()));
+        assert_eq!(ssl_mode_label(disable.get_ssl_mode()), "disable");
+
+        // libpq / tokio-postgres default when sslmode is omitted.
+        let default_mode: postgres::Config = "postgres://u:p@db.example/db".parse().unwrap();
+        assert_eq!(default_mode.get_ssl_mode(), SslMode::Prefer);
+        assert!(ssl_mode_needs_tls_connector(default_mode.get_ssl_mode()));
+        assert_eq!(ssl_mode_label(default_mode.get_ssl_mode()), "prefer");
+    }
+
+    #[test]
+    fn rustls_connector_builds_with_webpki_roots() {
+        // Construction must succeed without a live server — proves the TLS
+        // stack behind managed-Postgres URLs is wired (regression for #9858).
+        let _connector = make_rustls_connector();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn require_tls_connect_error_mentions_sslmode() {
+        // Unreachable endpoint with sslmode=require exercises the TLS connect
+        // path and the diagnostic error context operators grep for when a
+        // managed DB rejects plaintext (the old hard-coded NoTls failure mode).
+        let err = match PostgresMemory::new(
+            "test",
+            "postgres://zeroclaw:password@127.0.0.1:1/zeroclaw?sslmode=require",
+            "public",
+            "memories",
+            Some(1),
+            None,
+            None,
+        ) {
+            Ok(_) => panic!("unreachable TLS endpoint must fail connect"),
+            Err(err) => err,
+        };
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("sslmode=require"),
+            "connect error should name sslmode for operators; got: {msg}"
+        );
+        assert!(
+            msg.contains("failed to connect to PostgreSQL memory backend"),
+            "connect error should keep the stable backend failure prefix; got: {msg}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn disable_tls_connect_error_mentions_sslmode() {
+        let err = match PostgresMemory::new(
+            "test",
+            "postgres://zeroclaw:password@127.0.0.1:1/zeroclaw?sslmode=disable",
+            "public",
+            "memories",
+            Some(1),
+            None,
+            None,
+        ) {
+            Ok(_) => panic!("unreachable plaintext endpoint must fail connect"),
+            Err(err) => err,
+        };
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("sslmode=disable"),
+            "plaintext path should still surface sslmode; got: {msg}"
         );
     }
 

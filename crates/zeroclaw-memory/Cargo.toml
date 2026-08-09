@@ -25,9 +25,20 @@ sha2 = "0.10"
 tokio = { version = "1.50", default-features = false, features = ["fs", "io-util", "macros", "process", "sync", "time"] }
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 postgres = { version = "0.19", features = ["with-chrono-0_4"], optional = true }
+# TLS for managed Postgres (Neon/Azure/Supabase/…). Kept rustls-first to match
+# the rest of the workspace; connector choice is driven by URL `sslmode`.
+tokio-postgres-rustls = { version = "0.12", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
+webpki-roots = { version = "1.0.6", optional = true }
 
 [features]
-memory-postgres = ["dep:postgres", "zeroclaw-config/memory-postgres"]
+memory-postgres = [
+    "dep:postgres",
+    "dep:tokio-postgres-rustls",
+    "dep:rustls",
+    "dep:webpki-roots",
+    "zeroclaw-config/memory-postgres",
+]
 
 [dev-dependencies]
 filetime = "0.2"

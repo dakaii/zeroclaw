@@ -10489,7 +10489,16 @@ pub struct SqliteStorageConfig {
 #[prefix = "storage_postgres"]
 #[serde(default)]
 pub struct PostgresStorageConfig {
-    /// Connection URL (e.g. `"postgres://user:pass@host/db"`).
+    /// Connection URL (e.g. `"postgres://user:pass@host/db?sslmode=require"`).
+    ///
+    /// TLS is driven by the URL `sslmode` query parameter (libpq semantics):
+    /// - `require` / `prefer` (default): connect with rustls + public CA roots
+    /// - `disable`: plaintext `NoTls` (local compose / CI without TLS)
+    ///
+    /// Managed Postgres (Neon, Azure Flexible Server, Supabase, …) typically
+    /// requires TLS — include `sslmode=require` (or rely on the default
+    /// `prefer` against a TLS-only endpoint).
+    ///
     /// Accepts legacy aliases: dbURL, database_url, databaseUrl.
     #[serde(alias = "dbURL", alias = "database_url", alias = "databaseUrl")]
     #[secret]
