@@ -7,7 +7,9 @@ SOPs:
   `404` when no loaded SOP declares that exact path. It never falls back to an
   agent or model call.
 - `POST /webhook` checks for an exact `/webhook` SOP trigger first. If none
-  matches, it retains the normal webhook chat behavior.
+  matches, it retains the normal webhook chat behavior, including optional
+  SSE token streaming when the body sets `"stream": true` and `Accept` is
+  `text/event-stream`.
 
 Run these endpoints through `zeroclaw daemon` with `sop.sops_dir` configured.
 They use the daemon's shared SOP engine. A standalone `zeroclaw gateway start`,

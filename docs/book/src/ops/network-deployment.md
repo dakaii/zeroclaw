@@ -81,6 +81,23 @@ and use body HMAC verification instead.
 Gateway config writes take effect through the live gateway config view. Direct
 file edits require the normal daemon reload (or a standalone gateway restart).
 
+### Streaming chat tokens
+
+`POST /webhook` can stream assistant tokens while the agent loop runs. Send
+both `"stream": true` in the JSON body and `Accept: text/event-stream`. The
+response is Server-Sent Events with cumulative `event: token` frames, then
+`event: done`. Dropping the connection cancels the turn. Without those two
+signals the endpoint still returns one JSON `{ "response" }` body.
+
+```bash
+curl -N -X POST http://127.0.0.1:42617/webhook \
+  -H 'Authorization: Bearer <paired-token>' \
+  -H 'Accept: text/event-stream' \
+  -H 'Content-Type: application/json' \
+  -H 'X-Session-Id: chat-1' \
+  -d '{"message":"hello","stream":true}'
+```
+
 ## Remote daemon reload
 
 `POST /admin/reload` re-reads `config.toml` and rebuilds every subsystem in place (same PID, sub-second downtime). It is the supported way to apply config changes without a full restart. By default it only accepts **loopback** callers, so a remote dashboard or `curl` from another machine gets `403 Forbidden`.

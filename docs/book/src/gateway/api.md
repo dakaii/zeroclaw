@@ -122,6 +122,36 @@ the page degrades gracefully and points you at the raw spec at
 `/api/openapi.json` so you can use any compatible viewer
 (Insomnia, Postman, Swagger UI, etc.).
 
+## Webhook chat
+
+`POST /webhook` is the generic HTTP chat entry point. Pairing and
+`X-Webhook-Secret` follow the same rules as [Operations → Network
+deployment](../ops/network-deployment.md#generic-gateway-webhook-authentication).
+Send `{ "message": "..." }`. An optional `?agent=` query selects the configured
+agent alias, matching `/ws/chat`. `X-Session-Id` scopes memory for the turn.
+
+The default response is JSON `{ "response": "...", "model": "..." }` after the
+agent loop finishes.
+
+To stream live tokens instead, send `"stream": true` **and**
+`Accept: text/event-stream`. The handler drives the same `turn_streamed` agent
+loop as `/ws/chat` and writes:
+
+```
+event: token
+data: {"text":"<cumulative assistant text so far>"}
+
+event: done
+data: {}
+```
+
+A failed turn emits `event: error` with `data: {"message":"..."}` instead of
+`done`. Closing the HTTP connection cancels the in-flight turn. Omitting
+`stream`, or sending a non-SSE `Accept` value, keeps the JSON body.
+
+If a SOP trigger matches `/webhook`, SOP dispatch still runs first and returns
+its JSON result; streaming applies only to the chat fallback.
+
 ## Event stream contract
 
 `GET /api/events` is a raw Server-Sent Events stream of observable runtime

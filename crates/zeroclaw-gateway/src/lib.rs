@@ -50,6 +50,7 @@ pub mod voice_duplex;
     feature = "channel-whatsapp-cloud"
 ))]
 mod webhook_ingress;
+mod webhook_sse;
 pub mod ws;
 pub mod ws_approval;
 pub mod ws_sop_runs;
@@ -68,17 +69,11 @@ use axum::body::Bytes;
     feature = "channel-whatsapp-cloud"
 ))]
 use axum::extract::Path;
-#[cfg(any(
-    feature = "channel-linq",
-    feature = "channel-nextcloud",
-    feature = "channel-whatsapp-cloud"
-))]
-use axum::response::Response;
 use axum::{
     Router,
     extract::{ConnectInfo, Query, State},
     http::{HeaderMap, StatusCode, header},
-    response::{IntoResponse, Json},
+    response::{IntoResponse, Json, Response},
     routing::{delete, get, post, put},
 };
 use parking_lot::{Mutex, RwLock};
@@ -2429,7 +2424,7 @@ impl ::zeroclaw_api::attribution::Attributable for UnconfiguredModelProvider {
     }
 }
 
-fn needs_quickstart_for(model: &str) -> Option<anyhow::Error> {
+pub(crate) fn needs_quickstart_for(model: &str) -> Option<anyhow::Error> {
     if model.trim().is_empty() {
         ::zeroclaw_log::record!(
             WARN,
@@ -2451,7 +2446,7 @@ fn needs_quickstart_for(model: &str) -> Option<anyhow::Error> {
 /// Used by chat-dispatch error paths to map the marker to a 503
 /// `needs_quickstart` HTTP response or a more accurate channel-side
 /// reply, instead of the generic 500 / "sorry" catch-all.
-fn is_needs_quickstart_err(e: &anyhow::Error) -> bool {
+pub(crate) fn is_needs_quickstart_err(e: &anyhow::Error) -> bool {
     e.to_string().contains("needs_quickstart")
 }
 
@@ -2586,7 +2581,7 @@ pub(crate) async fn run_gateway_chat_with_tools(
     }
 }
 
-fn resolve_gateway_chat_agent_alias(
+pub(crate) fn resolve_gateway_chat_agent_alias(
     config: &Config,
     agent_override: Option<&str>,
 ) -> Option<String> {
@@ -2643,6 +2638,20 @@ fn sop_webhook_routes() -> Router<AppState> {
 #[derive(serde::Deserialize)]
 pub struct WebhookBody {
     pub message: String,
+    /// When true *and* `Accept` includes `text/event-stream`, `POST /webhook`
+    /// streams cumulative `event: token` frames instead of one JSON body.
+    #[serde(default)]
+    pub stream: bool,
+}
+
+impl WebhookBody {
+    #[cfg(test)]
+    fn from_message(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            stream: false,
+        }
+    }
 }
 
 /// Webhook query parameters
@@ -2908,16 +2917,16 @@ fn require_sop_dispatch_credentials(
 }
 
 /// POST /webhook — main webhook endpoint
-async fn handle_webhook(
+pub(crate) async fn handle_webhook(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     Query(query): Query<WebhookQuery>,
     headers: HeaderMap,
     body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
-) -> impl IntoResponse {
+) -> Response {
     let auth_verdict = match authorize_webhook_request(&state, peer_addr, &headers) {
         Ok(verdict) => verdict,
-        Err(response) => return response,
+        Err(response) => return response.into_response(),
     };
     let Json(webhook_body) = match body {
         Ok(b) => b,
@@ -2932,7 +2941,7 @@ async fn handle_webhook(
             let err = serde_json::json!({
                 "error": "Invalid JSON body. Expected: {\"message\": \"...\"}"
             });
-            return (StatusCode::BAD_REQUEST, Json(err));
+            return (StatusCode::BAD_REQUEST, Json(err)).into_response();
         }
     };
 
@@ -2944,20 +2953,20 @@ async fn handle_webhook(
     let sop_payload = serde_json::json!({ "message": &webhook_body.message }).to_string();
     let has_matching_sop = match api_sop_webhook::has_matching_webhook_sop(&state, "/webhook") {
         Ok(matches) => matches,
-        Err(response) => return response,
+        Err(response) => return response.into_response(),
     };
 
     if has_matching_sop {
         if let Err(response) = require_sop_dispatch_credentials(auth_verdict) {
-            return response;
+            return response.into_response();
         }
         if let Some(response) = check_webhook_idempotency(&state, &headers, None) {
-            return response;
+            return response.into_response();
         }
         if let api_sop_webhook::SopWebhookOutcome::Handled(response) =
             api_sop_webhook::dispatch_webhook_sop(&state, "/webhook", Some(&sop_payload)).await
         {
-            return response;
+            return response.into_response();
         }
         // The engine reported no match after all (e.g. a trigger was
         // unloaded between the pre-check above and dispatch); fall through
@@ -2991,12 +3000,12 @@ async fn handle_webhook(
                     "Unknown agent `{alias}` — no [agents.{alias}] entry configured."
                 )
             });
-            return (StatusCode::BAD_REQUEST, Json(err));
+            return (StatusCode::BAD_REQUEST, Json(err)).into_response();
         }
     }
 
     if !has_matching_sop && let Some(response) = check_webhook_idempotency(&state, &headers, None) {
-        return response;
+        return response.into_response();
     }
 
     let message = &webhook_body.message;
@@ -3013,6 +3022,18 @@ async fn handle_webhook(
                 session_id.as_deref(),
             )
             .await;
+    }
+
+    if webhook_sse::request_wants_sse(&headers, &webhook_body) {
+        #[cfg(test)]
+        record_gateway_chat_dispatch_for_test(message, session_id.as_deref(), agent_override);
+        return webhook_sse::stream_webhook_turn(
+            state,
+            message.to_string(),
+            session_id,
+            agent_override.map(str::to_owned),
+        )
+        .await;
     }
 
     let model_label = {
@@ -3037,6 +3058,7 @@ async fn handle_webhook(
     // dispatch below enters `process_message`, whose runtime turn guard is the
     // sole owner of lifecycle and LLM events. Emitting another bracket here
     // gives one webhook prompt two unrelated turn IDs.
+
     let started_at = Instant::now();
 
     match run_gateway_chat_with_tools(&state, message, session_id.as_deref(), agent_override).await
@@ -3048,7 +3070,7 @@ async fn handle_webhook(
             );
 
             let body = serde_json::json!({"response": response, "model": model_label});
-            (StatusCode::OK, Json(body))
+            (StatusCode::OK, Json(body)).into_response()
         }
         Err(e) => {
             let duration = started_at.elapsed();
@@ -3074,7 +3096,7 @@ async fn handle_webhook(
                     "error": "needs_quickstart",
                     "url": "/quickstart"
                 });
-                (StatusCode::SERVICE_UNAVAILABLE, Json(body))
+                (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
             } else {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -3084,7 +3106,7 @@ async fn handle_webhook(
                     "webhook model_provider error"
                 );
                 let err = serde_json::json!({"error": "LLM request failed"});
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(err)).into_response()
             }
         }
     }
@@ -4738,7 +4760,13 @@ path = "{trigger_path}"
         let valid = r#"{"message": "hello"}"#;
         let parsed: Result<WebhookBody, _> = serde_json::from_str(valid);
         assert!(parsed.is_ok());
-        assert_eq!(parsed.unwrap().message, "hello");
+        let parsed = parsed.unwrap();
+        assert_eq!(parsed.message, "hello");
+        assert!(!parsed.stream, "omitted stream must default off");
+
+        let streamed = r#"{"message": "hello", "stream": true}"#;
+        let parsed: WebhookBody = serde_json::from_str(streamed).unwrap();
+        assert!(parsed.stream);
 
         let missing = r#"{"other": "field"}"#;
         let parsed: Result<WebhookBody, _> = serde_json::from_str(missing);
@@ -6024,9 +6052,7 @@ path = "{trigger_path}"
         let mut headers = HeaderMap::new();
         headers.insert("X-Idempotency-Key", HeaderValue::from_static("abc-123"));
 
-        let body = Ok(Json(WebhookBody {
-            message: "hello".into(),
-        }));
+        let body = Ok(Json(WebhookBody::from_message("hello")));
         let first = handle_webhook(
             State(state.clone()),
             test_connect_info(),
@@ -6038,9 +6064,7 @@ path = "{trigger_path}"
         .into_response();
         assert_eq!(first.status(), StatusCode::OK);
 
-        let body = Ok(Json(WebhookBody {
-            message: "hello".into(),
-        }));
+        let body = Ok(Json(WebhookBody::from_message("hello")));
         let second = handle_webhook(
             State(state),
             test_connect_info(),
@@ -6234,9 +6258,7 @@ path = "{trigger_path}"
             test_connect_info(),
             Query(WebhookQuery::default()),
             webhook_secret_header(&secret),
-            Ok(Json(WebhookBody {
-                message: "deploy".into(),
-            })),
+            Ok(Json(WebhookBody::from_message("deploy"))),
         )
         .await
         .into_response();
@@ -6253,9 +6275,7 @@ path = "{trigger_path}"
             test_connect_info(),
             Query(WebhookQuery::default()),
             HeaderMap::new(),
-            Ok(Json(WebhookBody {
-                message: "chat instead".into(),
-            })),
+            Ok(Json(WebhookBody::from_message("chat instead"))),
         )
         .await
         .into_response();
@@ -6286,9 +6306,7 @@ path = "{trigger_path}"
             test_connect_info(),
             Query(WebhookQuery::default()),
             headers,
-            Ok(Json(WebhookBody {
-                message: "chat".into(),
-            })),
+            Ok(Json(WebhookBody::from_message("chat"))),
         )
         .await
         .into_response();
@@ -6498,9 +6516,7 @@ path = "{trigger_path}"
             test_connect_info(),
             Query(WebhookQuery::default()),
             HeaderMap::new(),
-            Ok(Json(WebhookBody {
-                message: "deploy".into(),
-            })),
+            Ok(Json(WebhookBody::from_message("deploy"))),
         )
         .await
         .into_response();
@@ -6641,9 +6657,7 @@ path = "{trigger_path}"
             test_connect_info(),
             Query(WebhookQuery::default()),
             forged,
-            Ok(Json(WebhookBody {
-                message: "hello".into(),
-            })),
+            Ok(Json(WebhookBody::from_message("hello"))),
         )
         .await
         .into_response();
@@ -6786,9 +6800,7 @@ path = "{trigger_path}"
             test_connect_info(),
             Query(WebhookQuery::default()),
             HeaderMap::new(),
-            Ok(Json(WebhookBody {
-                message: "deploy".into(),
-            })),
+            Ok(Json(WebhookBody::from_message("deploy"))),
         )
         .await
         .into_response();
@@ -6843,9 +6855,7 @@ path = "{trigger_path}"
                 agent: Some("missing".into()),
             }),
             webhook_secret_header(&secret),
-            Ok(Json(WebhookBody {
-                message: "deploy".into(),
-            })),
+            Ok(Json(WebhookBody::from_message("deploy"))),
         )
         .await
         .into_response();
@@ -6938,9 +6948,7 @@ path = "{trigger_path}"
                 agent: Some("ghost".into()),
             }),
             headers,
-            Ok(Json(WebhookBody {
-                message: "hello".into(),
-            })),
+            Ok(Json(WebhookBody::from_message("hello"))),
         )
         .await
         .into_response();
@@ -7053,9 +7061,7 @@ path = "{trigger_path}"
                 agent: Some("nova".into()),
             }),
             HeaderMap::new(),
-            Ok(Json(WebhookBody {
-                message: "hello".into(),
-            })),
+            Ok(Json(WebhookBody::from_message("hello"))),
         )
         .await
         .into_response();
@@ -7147,9 +7153,7 @@ path = "{trigger_path}"
 
         let headers = HeaderMap::new();
 
-        let body1 = Ok(Json(WebhookBody {
-            message: "hello one".into(),
-        }));
+        let body1 = Ok(Json(WebhookBody::from_message("hello one")));
         let first = handle_webhook(
             State(state.clone()),
             test_connect_info(),
@@ -7161,9 +7165,7 @@ path = "{trigger_path}"
         .into_response();
         assert_eq!(first.status(), StatusCode::OK);
 
-        let body2 = Ok(Json(WebhookBody {
-            message: "hello two".into(),
-        }));
+        let body2 = Ok(Json(WebhookBody::from_message("hello two")));
         let second = handle_webhook(
             State(state),
             test_connect_info(),
@@ -7355,9 +7357,7 @@ path = "{trigger_path}"
             test_connect_info(),
             Query(WebhookQuery::default()),
             HeaderMap::new(),
-            Ok(Json(WebhookBody {
-                message: "hello".into(),
-            })),
+            Ok(Json(WebhookBody::from_message("hello"))),
         )
         .await
         .into_response();
@@ -7447,9 +7447,7 @@ path = "{trigger_path}"
             test_connect_info(),
             Query(WebhookQuery::default()),
             headers,
-            Ok(Json(WebhookBody {
-                message: "hello".into(),
-            })),
+            Ok(Json(WebhookBody::from_message("hello"))),
         )
         .await
         .into_response();
@@ -7535,9 +7533,7 @@ path = "{trigger_path}"
             test_connect_info(),
             Query(WebhookQuery::default()),
             headers,
-            Ok(Json(WebhookBody {
-                message: "hello".into(),
-            })),
+            Ok(Json(WebhookBody::from_message("hello"))),
         )
         .await
         .into_response();
