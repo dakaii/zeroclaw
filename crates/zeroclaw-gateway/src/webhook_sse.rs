@@ -1,9 +1,8 @@
-//! Agent-loop SSE streaming for `POST /webhook`.
+//! SSE transport for `POST /webhook` chat turns.
 //!
-//! Opt-in only: `stream: true` on the JSON body *and* `Accept` containing
-//! `text/event-stream`. The JSON `{ "response" }` path is unchanged when
-//! either signal is absent. Tokens come from [`Agent::turn_streamed`] via
-//! [`TurnEvent::Chunk`]; this module does not split a completed string.
+//! Requires both `stream: true` on the JSON body and `Accept: text/event-stream`.
+//! Tokens are [`TurnEvent::Chunk`] values from [`Agent::turn_streamed`].
+//! Either signal missing keeps the JSON `{ "response" }` path.
 
 use super::{
     AppState, WebhookBody, is_needs_quickstart_err, needs_quickstart_for,
@@ -29,7 +28,7 @@ use zeroclaw_runtime::rpc::turn::{TurnAttribution, TurnError, TurnOutcome, execu
 
 const WEBHOOK_CHANNEL_KEY: &str = "webhook";
 
-/// True when the caller asked for live token frames rather than one JSON body.
+/// Dual opt-in: `stream: true` and `Accept` includes `text/event-stream`.
 pub(crate) fn request_wants_sse(headers: &HeaderMap, body: &WebhookBody) -> bool {
     body.stream && accept_includes_event_stream(headers)
 }
@@ -59,9 +58,8 @@ pub(crate) async fn stream_webhook_turn(
     }
 
     let mut config = state.config.read().clone();
-    // Gateway HTTP owns webhook autosave (`handle_webhook` writes unique keys
-    // to `state.mem`). The Agent constructor would otherwise duplicate that
-    // write under the fixed key `user_msg` on the per-agent backend.
+    // Gateway HTTP owns webhook autosave; disable Agent auto_save so the
+    // constructor does not also write `user_msg`.
     config.memory.auto_save = false;
 
     let agent_alias = match resolve_gateway_chat_agent_alias(&config, agent_override.as_deref()) {
@@ -192,9 +190,8 @@ pub(crate) async fn stream_webhook_turn(
         }
     });
 
-    // Half-second keep-alives also probe client disconnect so dropping the
-    // HTTP connection cancels the in-flight turn within about one second
-    // instead of waiting for the next model token.
+    // Keep-alives probe disconnect so a hung model does not hold the turn
+    // until the next token.
     Sse::new(WebhookSseStream {
         rx: sse_rx,
         _cancel_on_drop: CancelOnDrop(cancel),
@@ -601,10 +598,8 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                         }
                     }
                     let first = anthropic_partial_sse();
-                    // After the visible token, keep writing SSE comments so the
-                    // mock HTTP/1 connection notices the provider client abort.
-                    // A parked `pending()` body is never written again, so Hyper
-                    // would not drop it on FIN/RST and this flag would never fire.
+                    // Idle `pending()` bodies do not drop on client abort;
+                    // keep writing so Hyper notices the disconnect.
                     let stream = unfold(
                         (Some(first), DropFlag(cancelled), chunks_sent),
                         |(first, flag, chunks_sent)| async move {

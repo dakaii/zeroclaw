@@ -2638,8 +2638,8 @@ fn sop_webhook_routes() -> Router<AppState> {
 #[derive(serde::Deserialize)]
 pub struct WebhookBody {
     pub message: String,
-    /// When true *and* `Accept` includes `text/event-stream`, `POST /webhook`
-    /// streams cumulative `event: token` frames instead of one JSON body.
+    /// Combined with `Accept: text/event-stream`, requests SSE token frames
+    /// instead of a single JSON body.
     #[serde(default)]
     pub stream: bool,
 }
