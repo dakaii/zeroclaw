@@ -12,7 +12,7 @@ Pushed to GitHub Container Registry (`ghcr.io`) on every stable release:
 
 Multi-arch: `linux/amd64`, `linux/arm64`.
 
-> **Note on shell access:** The default `latest` image is intentionally distroless and does not include `sh`, `ash`, or `bash`. Use the `debian` tag if you need a shell inside the container (for example, to run `docker exec` for debugging).
+> **Note on shell access:** The default `latest` image is intentionally distroless and does not include `sh`, `ash`, or `bash`. LLM-only webhook and chat turns still work: the native runtime treats a missing shell as an unavailable capability and does not register shell tools. Use the `debian` tag if you need a shell inside the container (for example, to run `docker exec` for debugging or to enable shell tools).
 
 ## Alpine image (local build)
 

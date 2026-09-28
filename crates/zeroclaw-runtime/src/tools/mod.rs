@@ -683,9 +683,11 @@ pub fn all_tools_with_runtime(
     // Keep a shared runtime adapter available after constructing ShellTool.
     // Independent agentic delegates use it later to build the target-owned tool
     // registry; bounded delegates continue to use the parent `tool_arcs`
-    // snapshot below.
-    let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(RateLimitedTool::new(
+    // snapshot below. Distroless / shell-free runtimes omit the tool so it
+    // is not exposed as usable; `build_shell_command` still fails closed.
+    let mut tool_arcs: Vec<Arc<dyn Tool>> = Vec::new();
+    if has_shell_access {
+        tool_arcs.push(Arc::new(RateLimitedTool::new(
             ShellTool::new_with_sandbox(security.clone(), runtime.clone(), sandbox.clone())
                 .with_timeout_secs(if security.shell_timeout_secs > 0 {
                     security.shell_timeout_secs
@@ -695,7 +697,16 @@ pub fn all_tools_with_runtime(
                 .with_tui_env(tui_env)
                 .with_persistent_writes(persistent_writes),
             security.clone(),
-        )),
+        )));
+    } else {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "shell: skipped registration because the current runtime does not allow shell access"
+        );
+    }
+    let mut rest: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
                 FileReadTool::new_with_persistence(security.clone(), persistent_writes),
@@ -791,6 +802,7 @@ pub fn all_tools_with_runtime(
         Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
         Arc::new(TodoWriteTool::new()),
     ];
+    tool_arcs.append(&mut rest);
 
     // A SubAgent runs as an ephemeral clone of its parent and inherits the
     // parent's model verbatim; it must not be able to switch the active
@@ -3455,6 +3467,62 @@ const = true
         assert!(
             !tmp.path().join("new.txt").exists(),
             "file_write must not write anything on ephemeral"
+        );
+    }
+
+    #[test]
+    fn all_tools_omits_shell_when_runtime_has_no_shell_access() {
+        // Regression for zeroclaw-labs/zeroclaw#9859: distroless / shell-free
+        // native runtimes must not advertise the shell tool as usable.
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig {
+            enabled: false,
+            allowed_domains: vec![],
+            session_name: None,
+            ..BrowserConfig::default()
+        };
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
+
+        let tools = all_tools_with_runtime(
+            Arc::new(Config::default()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::without_shell()),
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .tools;
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(
+            !names.contains(&"shell"),
+            "shell-free runtime must not register the shell tool, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"file_read"),
+            "LLM-only tools must remain registered without a shell"
         );
     }
 

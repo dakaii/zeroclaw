@@ -748,6 +748,27 @@ mod tests {
         assert_eq!(tool.name(), "shell");
     }
 
+    #[tokio::test]
+    async fn shell_tool_fails_closed_without_shell_access() {
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::Full),
+            Arc::new(NativeRuntime::without_shell()),
+        );
+        let result = tool
+            .execute(json!({"command": "echo should-not-run", "approved": true}))
+            .await
+            .expect("execute should return a ToolResult, not a transport error");
+        assert!(
+            !result.success,
+            "shell-free runtime must fail closed, got: {result:?}"
+        );
+        let error = result.error.as_deref().unwrap_or("");
+        assert!(
+            error.contains("no shell access") || error.contains("no executable shell"),
+            "fail-closed error should name the missing shell capability, got: {error:?}"
+        );
+    }
+
     #[test]
     fn shell_tool_description() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());

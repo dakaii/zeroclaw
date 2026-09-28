@@ -12872,7 +12872,12 @@ pub struct RuntimeConfig {
     /// Shell binary the native runtime uses for command execution.
     ///
     /// Applies only to `runtime.kind = "native"`; other runtimes ignore it.
-    /// When unset or `null`, the system default `sh` is used.
+    /// When unset or `null`, the system default `sh` is used when that
+    /// binary can be resolved. If no executable shell exists (the
+    /// distroless release image), the native runtime is constructed
+    /// without shell access so LLM-only webhook and chat turns can
+    /// proceed. Shell-dependent tools are not registered and fail closed
+    /// if invoked.
     ///
     /// **Unix:** POSIX-compatible shells are invoked as
     /// `<shell> -c "<command>"`. Accepted forms:
@@ -12884,12 +12889,12 @@ pub struct RuntimeConfig {
     /// supported desktop host; other Unix interpreters are treated as
     /// POSIX-compatible shells.
     ///
-    /// The value is validated when the native runtime is constructed, so a bad
-    /// value is reported up front rather than failing on the first shell
-    /// command. Rejected: empty/whitespace; a relative path with separators
-    /// (e.g. `"./sh"`, `"bin/sh"` — use a bare `PATH` name or an absolute path
-    /// instead); a bare name not found on `PATH`; and a path that does not
-    /// exist or is not executable.
+    /// The value is validated when the native runtime is constructed.
+    /// Rejected as construction errors: empty/whitespace, and a relative
+    /// path with separators (e.g. `"./sh"`, `"bin/sh"` — use a bare `PATH`
+    /// name or an absolute path instead). A well-formed name or path that
+    /// cannot be resolved to an executable is treated as unavailable shell
+    /// access, not a construction failure.
     ///
     /// **Windows:** the value selects the interpreter *family* by its file stem
     /// (case-insensitive), which fixes the invocation convention:
