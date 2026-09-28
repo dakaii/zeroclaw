@@ -7,15 +7,43 @@ pub use zeroclaw_api::runtime_traits::{RuntimeAdapter, ShellDialect, ShellProfil
 
 use crate::schema::{RuntimeConfig, RuntimeKind};
 
+/// Default Unix native shell when `[runtime] shell` is unset.
+///
+/// Distroless release images do not ship this binary. `create_runtime`
+/// treats a missing default as "no shell access" rather than failing
+/// construction, so webhook/LLM-only turns can proceed.
+const DEFAULT_NATIVE_SHELL: &str = "sh";
+
 pub fn create_runtime(config: &RuntimeConfig) -> anyhow::Result<Box<dyn RuntimeAdapter>> {
     match config.kind {
         RuntimeKind::Native => {
-            let shell = config.shell.clone().unwrap_or_else(|| "sh".into());
+            let shell = config
+                .shell
+                .clone()
+                .unwrap_or_else(|| DEFAULT_NATIVE_SHELL.to_string());
             #[cfg(unix)]
-            validate_shell(&shell)?;
+            match probe_unix_shell(&shell)? {
+                ShellProbe::Ready => Ok(Box::new(NativeRuntime::with_shell(shell))),
+                ShellProbe::Unavailable { reason } => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "runtime_kind": "native",
+                                "configured_shell": shell,
+                                "reason": reason,
+                            })),
+                        "native runtime has no executable shell; continuing without shell access so LLM-only turns can proceed"
+                    );
+                    Ok(Box::new(NativeRuntime::without_shell()))
+                }
+            }
             #[cfg(windows)]
-            validate_shell_windows(&shell)?;
-            Ok(Box::new(NativeRuntime::with_shell(shell)))
+            {
+                validate_shell_windows(&shell)?;
+                Ok(Box::new(NativeRuntime::with_shell(shell)))
+            }
         }
         RuntimeKind::Docker => Ok(Box::new(DockerRuntime::new(config.docker.clone()))),
         RuntimeKind::Cloudflare => anyhow::bail!(
@@ -25,13 +53,25 @@ pub fn create_runtime(config: &RuntimeConfig) -> anyhow::Result<Box<dyn RuntimeA
 }
 
 #[cfg(unix)]
-fn validate_shell(shell: &str) -> anyhow::Result<()> {
+enum ShellProbe {
+    Ready,
+    Unavailable { reason: String },
+}
+
+/// Probe a configured Unix `runtime.shell`.
+///
+/// Invalid *values* (empty, relative paths) stay construction errors. A
+/// well-formed name or path that cannot be resolved to an executable is
+/// `Unavailable` so the native runtime can represent "no shell" instead of
+/// failing agent construction (distroless release images).
+#[cfg(unix)]
+fn probe_unix_shell(shell: &str) -> anyhow::Result<ShellProbe> {
     use std::os::unix::fs::PermissionsExt;
 
     // Android pins the shell to /system/bin/sh; the configured value is never
     // used, so don't reject it.
     if zeroclaw_api::platform::is_android() {
-        return Ok(());
+        return Ok(ShellProbe::Ready);
     }
 
     if shell.trim().is_empty() {
@@ -51,17 +91,23 @@ fn validate_shell(shell: &str) -> anyhow::Result<()> {
             .find(|candidate| candidate.is_file())
         {
             Some(found) => found,
-            None => anyhow::bail!(
-                "runtime.shell {shell:?} was not found on PATH; use an absolute path or install the shell"
-            ),
+            None => {
+                return Ok(ShellProbe::Unavailable {
+                    reason: format!(
+                        "runtime.shell {shell:?} was not found on PATH; use an absolute path or install the shell"
+                    ),
+                });
+            }
         }
     };
 
     if !resolved.exists() {
-        anyhow::bail!(
-            "runtime.shell {shell:?} (resolved to {}) does not exist",
-            resolved.display()
-        );
+        return Ok(ShellProbe::Unavailable {
+            reason: format!(
+                "runtime.shell {shell:?} (resolved to {}) does not exist",
+                resolved.display()
+            ),
+        });
     }
 
     let metadata = match resolved.metadata() {
@@ -84,13 +130,23 @@ fn validate_shell(shell: &str) -> anyhow::Result<()> {
     // this is a fail-fast sanity check, not a security gate.
     let mode = metadata.permissions().mode();
     if mode & 0o111 == 0 {
-        anyhow::bail!(
-            "runtime.shell {shell:?} (resolved to {}) is not executable",
-            resolved.display()
-        );
+        return Ok(ShellProbe::Unavailable {
+            reason: format!(
+                "runtime.shell {shell:?} (resolved to {}) is not executable",
+                resolved.display()
+            ),
+        });
     }
 
-    Ok(())
+    Ok(ShellProbe::Ready)
+}
+
+#[cfg(unix)]
+fn validate_shell(shell: &str) -> anyhow::Result<()> {
+    match probe_unix_shell(shell)? {
+        ShellProbe::Ready => Ok(()),
+        ShellProbe::Unavailable { reason } => anyhow::bail!("{reason}"),
+    }
 }
 
 /// Validate a configured `runtime.shell` on Windows.
@@ -249,6 +305,70 @@ mod tests {
             err.to_string().contains("not found on PATH"),
             "error should mention PATH, got: {err}"
         );
+    }
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[test]
+    fn create_runtime_treats_missing_shell_as_unavailable_capability() {
+        // Regression for zeroclaw-labs/zeroclaw#9859: distroless images have
+        // no `sh` on PATH. Per-agent `create_runtime()` used to fail and the
+        // webhook sanitized that to `{"error":"LLM request failed"}`. The
+        // factory must construct a shell-free native runtime instead so
+        // LLM-only turns and gateway startup share the same capability model.
+        let cfg = RuntimeConfig {
+            kind: RuntimeKind::Native,
+            shell: Some("zc-no-such-shell-on-path".into()),
+            ..RuntimeConfig::default()
+        };
+        let rt = create_runtime(&cfg)
+            .expect("missing executable shell must not fail native runtime construction");
+        assert_eq!(rt.name(), "native");
+        assert!(
+            !rt.has_shell_access(),
+            "missing shell must report no shell capability"
+        );
+        assert_eq!(rt.shell_dialect(), ShellDialect::None);
+        assert!(rt.shell_profile().is_none());
+        let err = rt
+            .build_shell_command("echo hi", &std::env::temp_dir())
+            .expect_err("shell-free runtime must fail closed on shell commands");
+        assert!(
+            err.to_string().contains("no executable shell"),
+            "fail-closed error should name the missing capability, got: {err}"
+        );
+    }
+
+    #[test]
+    fn default_native_shell_name_is_sh() {
+        // Distroless images fail because the unset default is `"sh"`. The
+        // factory probes this name; keep it stable so the missing-shell path
+        // remains the release-image contract.
+        assert_eq!(DEFAULT_NATIVE_SHELL, "sh");
+    }
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[test]
+    fn create_runtime_still_rejects_invalid_shell_values() {
+        for (shell, needle) in [
+            ("", "empty or whitespace"),
+            ("   ", "empty or whitespace"),
+            ("./sh", "relative path"),
+            ("bin/sh", "relative path"),
+        ] {
+            let cfg = RuntimeConfig {
+                kind: RuntimeKind::Native,
+                shell: Some(shell.into()),
+                ..RuntimeConfig::default()
+            };
+            let err = match create_runtime(&cfg) {
+                Ok(_) => panic!("invalid runtime.shell {shell:?} must still fail construction"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string().contains(needle),
+                "invalid shell {shell:?} should mention {needle:?}, got: {err}"
+            );
+        }
     }
 
     #[cfg(unix)]

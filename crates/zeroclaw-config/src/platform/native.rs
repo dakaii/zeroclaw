@@ -107,7 +107,8 @@ pub fn windows_std_cmd_shell_command(command: &str) -> std::process::Command {
 
 /// Native runtime — full access, runs on Mac/Linux/Windows/Docker/Raspberry Pi
 pub struct NativeRuntime {
-    /// Shell binary to invoke for command execution.
+    /// Shell binary to invoke for command execution, or `None` when no
+    /// executable shell is available (distroless / shell-free hosts).
     ///
     /// Unix: POSIX interpreters are invoked as `<shell> -c "<command>"` (e.g.
     /// `"sh"`, `"bash"`, `"/bin/zsh"`). PowerShell interpreters use
@@ -116,7 +117,10 @@ pub struct NativeRuntime {
     /// Windows: [`RuntimeAdapter::shell_dialect`] selects the invocation
     /// convention — `cmd.exe /C` (default, and for the cross-platform default
     /// `sh`) or PowerShell (`powershell`/`pwsh`).
-    shell: String,
+    ///
+    /// `None` reports [`ShellDialect::None`]: LLM-only turns stay available
+    /// and shell-dependent tools fail closed.
+    shell: Option<String>,
 }
 
 impl Default for NativeRuntime {
@@ -141,8 +145,24 @@ impl NativeRuntime {
     /// `pwsh` (bare name or absolute path) run through PowerShell; every other
     /// value runs through `cmd.exe /C`.
     pub fn with_shell(shell: String) -> Self {
-        Self { shell }
+        Self { shell: Some(shell) }
     }
+
+    /// Create a native runtime that reports no shell capability.
+    ///
+    /// Used when the configured or default shell cannot be resolved to an
+    /// executable. Agent construction and LLM-only turns stay available;
+    /// [`RuntimeAdapter::build_shell_command`] fails closed.
+    pub fn without_shell() -> Self {
+        Self { shell: None }
+    }
+}
+
+fn missing_native_shell_error() -> anyhow::Error {
+    anyhow::Error::msg(
+        "native runtime has no executable shell; LLM-only turns are supported, \
+         but shell commands are unavailable",
+    )
 }
 
 impl RuntimeAdapter for NativeRuntime {
@@ -175,7 +195,11 @@ impl RuntimeAdapter for NativeRuntime {
             return ShellDialect::Posix;
         }
 
-        if is_powershell_interpreter(&self.shell) {
+        let Some(shell) = self.shell.as_deref() else {
+            return ShellDialect::None;
+        };
+
+        if is_powershell_interpreter(shell) {
             return ShellDialect::PowerShell;
         }
 
@@ -209,8 +233,11 @@ impl RuntimeAdapter for NativeRuntime {
                     return ShellProfile::from_dialect(ShellDialect::Posix);
                 }
 
+                let Some(shell) = self.shell.as_deref() else {
+                    return None;
+                };
                 Some(ShellProfile {
-                    name: shell_stem(&self.shell).to_ascii_lowercase(),
+                    name: shell_stem(shell).to_ascii_lowercase(),
                     dialect,
                 })
             }
@@ -231,7 +258,9 @@ impl RuntimeAdapter for NativeRuntime {
             let shell = if is_android() {
                 "/system/bin/sh"
             } else {
-                &self.shell
+                self.shell
+                    .as_deref()
+                    .ok_or_else(missing_native_shell_error)?
             };
             let mut process = if self.shell_dialect() == ShellDialect::PowerShell {
                 tokio_powershell_command(shell, command)
@@ -246,8 +275,11 @@ impl RuntimeAdapter for NativeRuntime {
 
         #[cfg(target_os = "windows")]
         {
+            let Some(shell) = self.shell.as_deref() else {
+                return Err(missing_native_shell_error());
+            };
             let mut process = if self.shell_dialect() == ShellDialect::PowerShell {
-                windows_tokio_powershell_command(&self.shell, command)
+                windows_tokio_powershell_command(shell, command)
             } else {
                 windows_tokio_cmd_shell_command(command)
             };
@@ -288,6 +320,23 @@ mod tests {
     #[test]
     fn native_has_shell_access() {
         assert!(NativeRuntime::new().has_shell_access());
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn without_shell_reports_no_shell_capability() {
+        let runtime = NativeRuntime::without_shell();
+        assert_eq!(runtime.name(), "native");
+        assert!(!runtime.has_shell_access());
+        assert_eq!(runtime.shell_dialect(), ShellDialect::None);
+        assert!(runtime.shell_profile().is_none());
+        let err = runtime
+            .build_shell_command("echo hi", &std::env::temp_dir())
+            .expect_err("shell-free native runtime must fail closed");
+        assert!(
+            err.to_string().contains("no executable shell"),
+            "fail-closed error should name the missing shell capability, got: {err}"
+        );
     }
 
     #[test]

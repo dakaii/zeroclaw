@@ -458,6 +458,36 @@ fn source_containerfiles_stage_nested_workspace_members_during_prefetch() {
 }
 
 #[test]
+fn distroless_release_stays_shell_free() {
+    // Regression for zeroclaw-labs/zeroclaw#9859: the published latest image
+    // is intentionally distroless. Shipping `/bin/sh` would expand the
+    // attack surface; the native runtime treats a missing shell as an
+    // unavailable capability instead so webhook/LLM-only turns still work.
+    let dockerfile = repository_file("Dockerfile");
+    let release = dockerfile
+        .rsplit_once(" AS release")
+        .map(|(_, rest)| rest)
+        .expect("Dockerfile must define a distroless release stage");
+    for forbidden in [
+        "AS debian-shell",
+        "COPY --from=debian-shell",
+        "/bin/dash",
+        "/bin/sh",
+    ] {
+        assert!(
+            !release.contains(forbidden),
+            "distroless release stage must stay shell-free; found {forbidden}"
+        );
+    }
+
+    let ci = repository_file("Dockerfile.ci");
+    assert!(
+        !ci.contains("AS debian-shell") && !ci.contains("/bin/dash"),
+        "Dockerfile.ci must not add a dash/sh helper for the distroless variant"
+    );
+}
+
+#[test]
 fn containerfile_serializes_shared_cargo_caches() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let containerfile =
