@@ -233,9 +233,7 @@ impl RuntimeAdapter for NativeRuntime {
                     return ShellProfile::from_dialect(ShellDialect::Posix);
                 }
 
-                let Some(shell) = self.shell.as_deref() else {
-                    return None;
-                };
+                let shell = self.shell.as_deref()?;
                 Some(ShellProfile {
                     name: shell_stem(shell).to_ascii_lowercase(),
                     dialect,

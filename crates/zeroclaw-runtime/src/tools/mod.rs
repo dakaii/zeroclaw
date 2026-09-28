@@ -706,7 +706,7 @@ pub fn all_tools_with_runtime(
             "shell: skipped registration because the current runtime does not allow shell access"
         );
     }
-    tool_arcs.extend([
+    let mut rest: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
                 FileReadTool::new_with_persistence(security.clone(), persistent_writes),
@@ -801,7 +801,8 @@ pub fn all_tools_with_runtime(
         Arc::new(WeatherTool::new()),
         Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
         Arc::new(TodoWriteTool::new()),
-    ]);
+    ];
+    tool_arcs.append(&mut rest);
 
     // A SubAgent runs as an ephemeral clone of its parent and inherits the
     // parent's model verbatim; it must not be able to switch the active

@@ -141,7 +141,7 @@ fn probe_unix_shell(shell: &str) -> anyhow::Result<ShellProbe> {
     Ok(ShellProbe::Ready)
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn validate_shell(shell: &str) -> anyhow::Result<()> {
     match probe_unix_shell(shell)? {
         ShellProbe::Ready => Ok(()),
